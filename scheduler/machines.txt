@@ -1,0 +1,10 @@
+# HAProxy 后端机器清单（手工/离线模式）
+# 格式：机器名 起始IP
+# 约定：每台机器的 32 个出口 IP 从起始 IP 开始连续（起始 IP 不得晚于 x.x.x.224）
+# 部署前请把下面的示例（TEST-NET 测试网段）替换为真实公网 IP
+#
+# 注意：若使用一键部署 deploy/deploy.sh，它会直接从各代理机拉取真实出口 IP
+#       生成 haproxy-servers.cfg，无需本文件、也无连续 IP 要求
+machine1 203.0.113.1
+machine2 203.0.114.1
+machine3 203.0.115.1

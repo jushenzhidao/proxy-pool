@@ -1,0 +1,6 @@
+# 生成物（含真实出口 IP 清单），禁止提交
+agent/.env
+scheduler/haproxy-servers.cfg
+
+# 本地工作区数据（会话日志等），不上远端
+.workbuddy/

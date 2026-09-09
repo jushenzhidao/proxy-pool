@@ -1,0 +1,234 @@
+x-proxy-defaults: &proxy-defaults
+  build: .
+  network_mode: host
+  restart: unless-stopped
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+services:
+  proxy-01:
+    <<: *proxy-defaults
+    container_name: proxy-01
+    environment:
+      BIND_IP: ${IP_1:?IP_1 is not set - run generate-env.sh first}
+      PORT: 1080
+
+  proxy-02:
+    <<: *proxy-defaults
+    container_name: proxy-02
+    environment:
+      BIND_IP: ${IP_2:?IP_2 is not set - run generate-env.sh first}
+      PORT: 1080
+
+  proxy-03:
+    <<: *proxy-defaults
+    container_name: proxy-03
+    environment:
+      BIND_IP: ${IP_3:?IP_3 is not set - run generate-env.sh first}
+      PORT: 1080
+
+  proxy-04:
+    <<: *proxy-defaults
+    container_name: proxy-04
+    environment:
+      BIND_IP: ${IP_4:?IP_4 is not set - run generate-env.sh first}
+      PORT: 1080
+
+  proxy-05:
+    <<: *proxy-defaults
+    container_name: proxy-05
+    environment:
+      BIND_IP: ${IP_5:?IP_5 is not set - run generate-env.sh first}
+      PORT: 1080
+
+  proxy-06:
+    <<: *proxy-defaults
+    container_name: proxy-06
+    environment:
+      BIND_IP: ${IP_6:?IP_6 is not set - run generate-env.sh first}
+      PORT: 1080
+
+  proxy-07:
+    <<: *proxy-defaults
+    container_name: proxy-07
+    environment:
+      BIND_IP: ${IP_7:?IP_7 is not set - run generate-env.sh first}
+      PORT: 1080
+
+  proxy-08:
+    <<: *proxy-defaults
+    container_name: proxy-08
+    environment:
+      BIND_IP: ${IP_8:?IP_8 is not set - run generate-env.sh first}
+      PORT: 1080
+
+  proxy-09:
+    <<: *proxy-defaults
+    container_name: proxy-09
+    environment:
+      BIND_IP: ${IP_9:?IP_9 is not set - run generate-env.sh first}
+      PORT: 1080
+
+  proxy-10:
+    <<: *proxy-defaults
+    container_name: proxy-10
+    environment:
+      BIND_IP: ${IP_10:?IP_10 is not set - run generate-env.sh first}
+      PORT: 1080
+
+  proxy-11:
+    <<: *proxy-defaults
+    container_name: proxy-11
+    environment:
+      BIND_IP: ${IP_11:?IP_11 is not set - run generate-env.sh first}
+      PORT: 1080
+
+  proxy-12:
+    <<: *proxy-defaults
+    container_name: proxy-12
+    environment:
+      BIND_IP: ${IP_12:?IP_12 is not set - run generate-env.sh first}
+      PORT: 1080
+
+  proxy-13:
+    <<: *proxy-defaults
+    container_name: proxy-13
+    environment:
+      BIND_IP: ${IP_13:?IP_13 is not set - run generate-env.sh first}
+      PORT: 1080
+
+  proxy-14:
+    <<: *proxy-defaults
+    container_name: proxy-14
+    environment:
+      BIND_IP: ${IP_14:?IP_14 is not set - run generate-env.sh first}
+      PORT: 1080
+
+  proxy-15:
+    <<: *proxy-defaults
+    container_name: proxy-15
+    environment:
+      BIND_IP: ${IP_15:?IP_15 is not set - run generate-env.sh first}
+      PORT: 1080
+
+  proxy-16:
+    <<: *proxy-defaults
+    container_name: proxy-16
+    environment:
+      BIND_IP: ${IP_16:?IP_16 is not set - run generate-env.sh first}
+      PORT: 1080
+
+  proxy-17:
+    <<: *proxy-defaults
+    container_name: proxy-17
+    environment:
+      BIND_IP: ${IP_17:?IP_17 is not set - run generate-env.sh first}
+      PORT: 1080
+
+  proxy-18:
+    <<: *proxy-defaults
+    container_name: proxy-18
+    environment:
+      BIND_IP: ${IP_18:?IP_18 is not set - run generate-env.sh first}
+      PORT: 1080
+
+  proxy-19:
+    <<: *proxy-defaults
+    container_name: proxy-19
+    environment:
+      BIND_IP: ${IP_19:?IP_19 is not set - run generate-env.sh first}
+      PORT: 1080
+
+  proxy-20:
+    <<: *proxy-defaults
+    container_name: proxy-20
+    environment:
+      BIND_IP: ${IP_20:?IP_20 is not set - run generate-env.sh first}
+      PORT: 1080
+
+  proxy-21:
+    <<: *proxy-defaults
+    container_name: proxy-21
+    environment:
+      BIND_IP: ${IP_21:?IP_21 is not set - run generate-env.sh first}
+      PORT: 1080
+
+  proxy-22:
+    <<: *proxy-defaults
+    container_name: proxy-22
+    environment:
+      BIND_IP: ${IP_22:?IP_22 is not set - run generate-env.sh first}
+      PORT: 1080
+
+  proxy-23:
+    <<: *proxy-defaults
+    container_name: proxy-23
+    environment:
+      BIND_IP: ${IP_23:?IP_23 is not set - run generate-env.sh first}
+      PORT: 1080
+
+  proxy-24:
+    <<: *proxy-defaults
+    container_name: proxy-24
+    environment:
+      BIND_IP: ${IP_24:?IP_24 is not set - run generate-env.sh first}
+      PORT: 1080
+
+  proxy-25:
+    <<: *proxy-defaults
+    container_name: proxy-25
+    environment:
+      BIND_IP: ${IP_25:?IP_25 is not set - run generate-env.sh first}
+      PORT: 1080
+
+  proxy-26:
+    <<: *proxy-defaults
+    container_name: proxy-26
+    environment:
+      BIND_IP: ${IP_26:?IP_26 is not set - run generate-env.sh first}
+      PORT: 1080
+
+  proxy-27:
+    <<: *proxy-defaults
+    container_name: proxy-27
+    environment:
+      BIND_IP: ${IP_27:?IP_27 is not set - run generate-env.sh first}
+      PORT: 1080
+
+  proxy-28:
+    <<: *proxy-defaults
+    container_name: proxy-28
+    environment:
+      BIND_IP: ${IP_28:?IP_28 is not set - run generate-env.sh first}
+      PORT: 1080
+
+  proxy-29:
+    <<: *proxy-defaults
+    container_name: proxy-29
+    environment:
+      BIND_IP: ${IP_29:?IP_29 is not set - run generate-env.sh first}
+      PORT: 1080
+
+  proxy-30:
+    <<: *proxy-defaults
+    container_name: proxy-30
+    environment:
+      BIND_IP: ${IP_30:?IP_30 is not set - run generate-env.sh first}
+      PORT: 1080
+
+  proxy-31:
+    <<: *proxy-defaults
+    container_name: proxy-31
+    environment:
+      BIND_IP: ${IP_31:?IP_31 is not set - run generate-env.sh first}
+      PORT: 1080
+
+  proxy-32:
+    <<: *proxy-defaults
+    container_name: proxy-32
+    environment:
+      BIND_IP: ${IP_32:?IP_32 is not set - run generate-env.sh first}
+      PORT: 1080
