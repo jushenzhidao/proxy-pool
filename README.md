@@ -123,6 +123,16 @@ PREBUILT=1 IMAGE_TAG=v1.0.0 ./deploy/deploy.sh   # 锁定版本，默认 latest
 
 重复执行即全量重部署（代理容器会短暂重启，秒级中断）。
 
+### 非 32 IP 机器（少卡机器）
+
+`agent/generate-env.sh` 会自动按**本机实际检测到的公网 IP 数量**生成对应个数的 `docker-compose.yml` 服务（proxy-01..proxy-N），无需手工删改。例如 2 IP 机器会起 proxy-01/proxy-02，1 IP 机器只起 proxy-01；每容器 host 网络绑定 `IP:1080`，同机多 IP 互不冲突。
+
+若调度机 HAProxy 与代理机**同机部署**（3proxy 已占用本机各 IP 的 1080），入口需换空闲端口：
+
+```bash
+sudo ENTRY_PORT=2080 ./assemble-config.sh && sudo systemctl reload haproxy
+```
+
 ### 路径 B：手工部署
 
 适用于机器 IP 段已知且连续、或无法从运维机直连全部代理机的场景。
@@ -245,7 +255,7 @@ for i in $(seq 1 8); do curl -s --socks5 proxy-pool.example.com:1080 http://ifco
 
 ## 已知约束
 
-1. **代理机必须恰好 32 个公网 IP。** `docker-compose.yml` 硬编码 32 个服务，且用 `${IP_N:?...}` 强制校验。IP 不足时 `generate-env.sh` 会告警、`docker compose up` 会直接失败；IP 多于 32 时多余的会被忽略。非 32 卡的机器需自行增删 compose 中的服务定义。
+1. **代理机 IP 数量不限（不再硬编码 32）。** `generate-env.sh` 会按本机实际检测到的公网 IP 数量自动生成对应数量的 `docker-compose.yml` 服务（proxy-01..proxy-N）；检测到 0 个公网 IP 时直接报错退出。每容器绑定 `IP:1080`（host 网络），同机多 IP 互不冲突。
 2. **路径 B 要求 IP 连续。** 手工模式下后端 IP 由起始 IP 推算，不连续的实际 IP 会导致后端地址错误；请改用路径 A。
 3. **IP 扫描依赖 `ip` 命令。** 脚本会过滤 `127.`、`10.`、`192.168.`、`172.16-31.`、`169.254.` 网段，其余均视为公网 IP；若宿主机有其他非公网地址需手动调整 `.env`。
 4. **`.env` 与 `haproxy-servers.cfg` 不入库。** 二者含真实出口 IP，已在 `.gitignore` 中排除。
