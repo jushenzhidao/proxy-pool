@@ -125,6 +125,9 @@ jobs:
           context: ./agent
           file: ./agent/Dockerfile
           push: true
+          # 固定 amd64：防止 runner 默认架构变化导致镜像架构漂移（生产代理机为 x86_64）。
+          # 需要 arm64 时改为 linux/amd64,linux/arm64 并加 docker/setup-qemu-action。
+          platforms: linux/amd64
           tags: |
             ${{ steps.image.outputs.name }}:${{ needs.release.outputs.version }}
             ${{ steps.image.outputs.name }}:latest
@@ -136,21 +139,33 @@ jobs:
           set -euo pipefail
           IMG="${{ steps.image.outputs.name }}:${{ needs.release.outputs.version }}"
 
-          # entrypoint 必填 BIND_IP；容器网络下用 0.0.0.0，映射出来做连通性验证
+          # entrypoint 必填 BIND_IP；容器网络下监听 0.0.0.0，映射到 runner 本地做握手
           docker run -d --name smoke -e BIND_IP=0.0.0.0 -p 1080:1080 "$IMG"
-
-          for i in $(seq 1 15); do
-            if docker exec smoke sh -c 'netstat -ln 2>/dev/null | grep -q ":1080" || \
-                                        ss -ln 2>/dev/null | grep -q ":1080"'; then
-              break
-            fi
-            sleep 1
-          done
 
           echo "--- 3proxy.cfg ---"
           docker exec smoke cat /etc/3proxy/3proxy.cfg
 
-          # 端口必须真的在监听，否则镜像启动即失败
-          docker exec smoke sh -c 'ss -ln | grep -q ":1080" || netstat -ln | grep -q ":1080"'
+          # 真实 SOCKS5 握手：发 greeting 期望回 0500。
+          # 比检测端口更严格——镜像里没有 ss/netstat，且端口在监听不等于代理可用。
+          # 每次握手放在子 bash 中，失败返回空串后重试，避免 exec 失败终止主 shell。
+          REPLY=""
+          for i in $(seq 1 15); do
+            REPLY=$(timeout 10 bash -c '
+              exec 3<>/dev/tcp/127.0.0.1/1080 || exit 1
+              printf "\x05\x01\x00" >&3
+              timeout 3 head -c 2 <&3 | od -An -tx1 | tr -d " \n"
+            ' 2>/dev/null || true)
+            [ -n "$REPLY" ] && break
+            sleep 2
+          done
+
+          echo "socks5 handshake reply: '${REPLY}'"
+          if [ "$REPLY" != "0500" ]; then
+            echo "ERROR: SOCKS5 handshake failed - image is not serving on 1080" >&2
+            docker logs smoke 2>&1 | tail -20
+            docker rm -f smoke
+            exit 1
+          fi
+
           docker rm -f smoke
           echo "Smoke test passed: $IMG"

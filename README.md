@@ -59,7 +59,7 @@
 ```
 proxy-pool/
 ├── agent/                     # 部署到每台代理机
-│   ├── Dockerfile             # 基于 alpine:3.19 的 3proxy 镜像
+│   ├── Dockerfile             # 3proxy 镜像（ubuntu:22.04 + 官方预编译 deb）
 │   ├── entrypoint.sh          # 按环境变量生成 3proxy 配置并前台启动
 │   ├── docker-compose.yml     # proxy-01 ~ proxy-32 共 32 个服务
 │   ├── generate-env.sh        # 扫描公网 IP，生成 .env（IP_1..IP_N）
