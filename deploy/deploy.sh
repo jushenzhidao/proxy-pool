@@ -6,6 +6,8 @@
 #   ./deploy.sh                                        # 按 proxy-hosts.txt 全量部署
 #   SSH_OPTS="-p 2222 -i ~/.ssh/deploy_key" ./deploy.sh  # 自定义 SSH 参数
 #   REMOTE_DIR=/data/proxy-pool ./deploy.sh              # 自定义远程目录
+#   PREBUILT=1 ./deploy.sh                               # 拉 ghcr.io 预构建镜像，不在远端 build
+#   PREBUILT=1 IMAGE_TAG=v1.0.0 ./deploy.sh              # 锁定镜像版本（默认 latest）
 #
 # 流程：远端检查 docker -> rsync agent/ -> 生成 .env 并重启容器 -> 拉回 IP 清单
 #       -> 生成 scheduler/haproxy-servers.cfg -> 本机若可写 /etc/haproxy 则自动组装+reload
@@ -21,6 +23,17 @@ AGENT_DIR="$REPO_ROOT/agent"
 SCHED_DIR="$REPO_ROOT/scheduler"
 HOSTS_FILE="$DEPLOY_DIR/proxy-hosts.txt"
 REMOTE_DIR="${REMOTE_DIR:-/opt/proxy-pool}"
+IMAGE_TAG="${IMAGE_TAG:-latest}"
+case "$IMAGE_TAG" in
+    *[!A-Za-z0-9._-]*) fail "IMAGE_TAG contains unsafe characters: $IMAGE_TAG" ;;
+esac
+
+# 预构建镜像模式：拉 ghcr.io 镜像；否则在远端本地构建
+if [ "${PREBUILT:-0}" = "1" ]; then
+    UP_CMD='docker compose pull && docker compose up -d'
+else
+    UP_CMD='docker compose up -d --build'
+fi
 SSH_OPTS="-o ConnectTimeout=10 ${SSH_OPTS:-}"   # shellcheck disable=SC2086
 
 fail() { echo "ERROR: $*" >&2; exit 1; }
@@ -63,7 +76,7 @@ deploy_one() {
         echo "[$tag] generating env and restarting containers ..."
         ssh $SSH_OPTS "$target" "cd $REMOTE_DIR && ./generate-env.sh && \
             (docker compose down --timeout 5 >/dev/null 2>&1 || true) && \
-            docker compose up -d --build" \
+            export IMAGE_TAG='$IMAGE_TAG' && $UP_CMD" \
             || { echo "[$tag] FAIL: remote deploy failed"; return 1; }
 
         echo "[$tag] fetching real IP list ..."

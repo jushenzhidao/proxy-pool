@@ -1,0 +1,156 @@
+# push 到 main 自动发版：递增 patch 版本号 -> 创建 GitHub Release
+#                        -> 构建 3proxy 镜像并推送到 ghcr.io（GitHub Packages）
+#
+# 版本号只自增 patch；需要 minor/major 时手动打 tag，workflow 会以该 tag 为新基线继续。
+# 提交信息含 [skip release] 可跳过本次发版。
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# 并发跑会造成 tag 竞争与版本号重复，排队执行而非取消
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write # 创建 tag 与 Release
+  packages: write # 推送镜像到 ghcr.io
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  release:
+    name: Bump version & create release
+    if: ${{ !contains(github.event.head_commit.message, '[skip release]') }}
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.bump.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # 浅克隆拿不到历史 tag，版本号会永远从 v0.0.1 起算
+
+      - name: Bump patch version
+        id: bump
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # 用 --sort=-v:refname 而非 git describe：后者取「最近可达的 tag」，有合并历史时会挑错
+          RAW_LATEST="$(git tag --list 'v*' --sort=-v:refname | head -n1)"
+          BASE="${RAW_LATEST:-v0.0.0}"   # 冷启动：零 tag 时从 v0.0.0 起算
+          IFS=. read -r MA MI PA <<< "${BASE#v}"
+          NEW="v${MA}.${MI}.$((PA + 1))"
+
+          if git rev-parse "$NEW" >/dev/null 2>&1; then
+            echo "ERROR: tag $NEW already exists - refusing to overwrite" >&2
+            exit 1
+          fi
+
+          echo "version=$NEW" >> "$GITHUB_OUTPUT"
+          echo "Bumping ${RAW_LATEST:-<none>} -> $NEW"
+
+          # 生成 changelog：零 tag 时取全部历史
+          if [ -z "$RAW_LATEST" ]; then RANGE=HEAD; else RANGE="${RAW_LATEST}..HEAD"; fi
+          {
+            echo '## Changes'
+            echo
+            git log "$RANGE" --pretty='- %s (%h)' --no-merges
+          } > changelog.md
+
+          git tag -a "$NEW" -m "Release $NEW"
+          git push origin "$NEW"
+
+          # latest 是可变 tag，强制移动是预期行为
+          git tag -f latest
+          git push -f origin latest
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.bump.outputs.version }}"
+          IMAGE="${REGISTRY}/${GITHUB_REPOSITORY,,}"
+
+          {
+            cat changelog.md
+            echo
+            echo '## Container image'
+            echo
+            echo '```bash'
+            echo "docker pull ${IMAGE}:${VERSION}"
+            echo '```'
+            echo
+            echo '镜像同时打上 `latest` 标签。'
+          } > notes.md
+
+          gh release create "$VERSION" --title "$VERSION" --notes-file notes.md
+
+  image:
+    name: Build & push 3proxy image
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve image name
+        id: image
+        run: echo "name=${REGISTRY}/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: ./agent
+          file: ./agent/Dockerfile
+          push: true
+          tags: |
+            ${{ steps.image.outputs.name }}:${{ needs.release.outputs.version }}
+            ${{ steps.image.outputs.name }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test image
+        run: |
+          set -euo pipefail
+          IMG="${{ steps.image.outputs.name }}:${{ needs.release.outputs.version }}"
+
+          # entrypoint 必填 BIND_IP；容器网络下用 0.0.0.0，映射出来做连通性验证
+          docker run -d --name smoke -e BIND_IP=0.0.0.0 -p 1080:1080 "$IMG"
+
+          for i in $(seq 1 15); do
+            if docker exec smoke sh -c 'netstat -ln 2>/dev/null | grep -q ":1080" || \
+                                        ss -ln 2>/dev/null | grep -q ":1080"'; then
+              break
+            fi
+            sleep 1
+          done
+
+          echo "--- 3proxy.cfg ---"
+          docker exec smoke cat /etc/3proxy/3proxy.cfg
+
+          # 端口必须真的在监听，否则镜像启动即失败
+          docker exec smoke sh -c 'ss -ln | grep -q ":1080" || netstat -ln | grep -q ":1080"'
+          docker rm -f smoke
+          echo "Smoke test passed: $IMG"

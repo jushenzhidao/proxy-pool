@@ -72,6 +72,8 @@ proxy-pool/
 ├── deploy/
 │   ├── deploy.sh              # 一键多机部署（并行 rsync + 拉真实 IP）
 │   └── proxy-hosts.txt        # 代理机 SSH 清单
+├── .github/workflows/
+│   └── release.yml            # push main 自动发版 + 推镜像到 ghcr.io
 └── docs/
     └── proxy-pool-solution.md # 方案设计文档（含配置逐项说明）
 ```
@@ -109,7 +111,13 @@ SSH_OPTS="-p 2222 -i ~/.ssh/deploy_key" ./deploy/deploy.sh
 
 # 自定义远程安装目录
 REMOTE_DIR=/data/proxy-pool ./deploy/deploy.sh
+
+# 使用 ghcr.io 预构建镜像，远端不执行 docker build
+PREBUILT=1 ./deploy/deploy.sh
+PREBUILT=1 IMAGE_TAG=v1.0.0 ./deploy/deploy.sh   # 锁定版本，默认 latest
 ```
+
+> `PREBUILT=1` 时各代理机从 ghcr.io 拉取镜像。若镜像不是 public，需先在每台代理机执行 `docker login ghcr.io`。
 
 脚本会输出 `Summary: N machine(s) OK, 0 failed, M backends`。若本机 `/etc/haproxy` 可写，会自动执行 `assemble-config.sh` 并 `systemctl reload haproxy`；否则打印需要手动执行的命令。
 
@@ -241,6 +249,47 @@ for i in $(seq 1 8); do curl -s --socks5 proxy-pool.example.com:1080 http://ifco
 2. **路径 B 要求 IP 连续。** 手工模式下后端 IP 由起始 IP 推算，不连续的实际 IP 会导致后端地址错误；请改用路径 A。
 3. **IP 扫描依赖 `ip` 命令。** 脚本会过滤 `127.`、`10.`、`192.168.`、`172.16-31.`、`169.254.` 网段，其余均视为公网 IP；若宿主机有其他非公网地址需手动调整 `.env`。
 4. **`.env` 与 `haproxy-servers.cfg` 不入库。** 二者含真实出口 IP，已在 `.gitignore` 中排除。
+
+---
+
+## 发布与镜像（Releases / Packages）
+
+`.github/workflows/release.yml` 在**每次 push 到 `main`** 时自动发版，产出两件东西：
+
+| 产物 | 位置 | 内容 |
+|------|------|------|
+| Release | `github.com/jushenzhidao/proxy-pool/releases` | 版本号 tag + 由 commit 生成的 changelog |
+| 容器镜像 | `ghcr.io/jushenzhidao/proxy-pool` | 3proxy 镜像，打上版本号与 `latest` 两个 tag |
+
+执行顺序：`release` job 递增版本号 → 创建 tag → 创建 Release；随后 `image` job 构建镜像、推送 ghcr.io、跑启动冒烟测试。
+
+### 版本号规则
+
+- 只自增 **patch**：`v1.2.3` → `v1.2.4`。仓库零 tag 时从 `v0.0.0` 起算，首次发版为 `v0.0.1`。
+- 需要 minor/major 时**手动打 tag**（`git tag v2.0.0 && git push origin v2.0.0`），workflow 会以该 tag 为新基线继续自增。
+- `latest` 是可变 tag，每次发版强制移动。下游若固定引用 `latest` 会随之跳版本，生产环境建议锁定具体版本号。
+
+### 跳过与手动触发
+
+```bash
+git commit -m "chore: 调文档 [skip release]"   # 提交信息含 [skip release] 则跳过发版
+```
+
+也可在 GitHub Actions 页面用 **Run workflow**（`workflow_dispatch`）手动触发。
+
+### 使用预构建镜像
+
+```bash
+docker pull ghcr.io/jushenzhidao/proxy-pool:v0.0.1
+```
+
+一键部署时改用预构建镜像（远端不执行 `docker build`）：
+
+```bash
+PREBUILT=1 IMAGE_TAG=v0.0.1 ./deploy/deploy.sh
+```
+
+首次发版后需要注意：GitHub Packages 的镜像默认**继承仓库可见性**，私有仓库产出的镜像也是私有的，需在 package 设置中改为 public，或在各代理机执行 `docker login ghcr.io` 后使用。
 
 ---
 

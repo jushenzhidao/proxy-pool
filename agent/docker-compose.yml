@@ -1,4 +1,9 @@
+# 镜像引用：本地构建（默认）或直接用 ghcr.io 预构建镜像
+#   本地构建：  docker compose up -d --build
+#   拉预构建：  IMAGE_TAG=v1.0.0 docker compose pull && docker compose up -d
+#   可覆盖：    IMAGE_REPO / IMAGE_TAG
 x-proxy-defaults: &proxy-defaults
+  image: ${IMAGE_REPO:-ghcr.io/jushenzhidao/proxy-pool}:${IMAGE_TAG:-latest}
   build: .
   network_mode: host
   restart: unless-stopped
