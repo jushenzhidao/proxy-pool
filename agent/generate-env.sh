@@ -28,6 +28,25 @@ if [ "$COUNT" -eq 0 ]; then
     exit 1
 fi
 
+# ---- SOCKS5 访问认证凭证（首次运行自动创建；内容留空=无认证）----
+CRED_FILE="socks-credentials.env"
+if [ ! -f "$CRED_FILE" ]; then
+    cat > "$CRED_FILE" <<'EOC'
+# SOCKS5 访问认证（可选）。填写 SOCKS_USER 与 SOCKS_PASS 即启用用户名/密码认证；
+# 两项留空则保持无认证模式（仅靠来源 IP / 防火墙限制）。
+#
+# 改密码：编辑本文件后，在每台代理机执行：
+#     docker compose up -d --force-recreate
+# 或在本机执行 deploy/deploy.sh 一键下发到所有机器（HAProxy 无需改动）。
+#
+# 可选：限定客户端来源 IP/网段（逗号分隔，如 1.2.3.4,5.6.7.0/24），留空表示不限。
+SOCKS_USER=
+SOCKS_PASS=
+ALLOW_SRC=
+EOC
+    echo "Created credential template -> ${CRED_FILE}"
+fi
+
 # ---- 按实际 IP 数量生成 docker-compose.yml ----
 # host 网络：每个容器绑定一个公网 IP 的 1080 端口，同机多 IP 互不冲突
 COMPOSE_FILE="docker-compose.yml"
@@ -45,6 +64,8 @@ for ip in $IPS; do
         printf '    image: ${IMAGE_REPO:-ghcr.io/jushenzhidao/proxy-pool}:${IMAGE_TAG:-latest}\n'
         printf '    build: .\n'
         printf '    container_name: %s\n' "$name"
+        printf '    env_file:\n'
+        printf '      - ./socks-credentials.env\n'
         printf '    network_mode: host\n'
         printf '    restart: unless-stopped\n'
         printf '    logging:\n'

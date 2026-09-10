@@ -12,7 +12,7 @@ FROM alpine:3.22 AS fetcher
 
 ARG THREEPROXY_VERSION=0.9.9.0
 # BuildKit 自动注入（amd64 / arm64 / arm/v7 ...），据此选择对应架构的 deb
-ARG TARGETARCH
+ARG TARGETARCH=amd64
 
 RUN set -eux; \
     apk add --no-cache curl; \

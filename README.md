@@ -60,9 +60,10 @@
 proxy-pool/
 ├── agent/                     # 部署到每台代理机
 │   ├── Dockerfile             # 3proxy 镜像（ubuntu:22.04 + 官方预编译 deb）
-│   ├── entrypoint.sh          # 按环境变量生成 3proxy 配置并前台启动
-│   ├── docker-compose.yml     # proxy-01 ~ proxy-32 共 32 个服务
-│   ├── generate-env.sh        # 扫描公网 IP，生成 .env（IP_1..IP_N）
+│   ├── entrypoint.sh          # 按环境变量生成 3proxy 配置并前台启动（支持可选密码认证）
+│   ├── generate-env.sh        # 扫描公网 IP，生成 .env 与 docker-compose.yml
+│   ├── docker-compose.yml     # 生成物：按本机 IP 数重写为 proxy-01..proxy-N
+│   ├── socks-credentials.env  # SOCKS5 访问认证凭证（可选），已 gitignore
 │   └── .env                   # 生成物，已 gitignore
 ├── scheduler/                 # 仅在调度机使用
 │   ├── generate-haproxy.sh    # 由 machines.txt 生成后端列表
@@ -88,7 +89,7 @@ proxy-pool/
 | 调度机 | HAProxy 2.x；systemd（可选，用于 reload） |
 | 运维机 | `rsync`、`ssh`；到所有代理机免密 SSH；到调度机有 `/etc/haproxy` 写权限（自动 reload 时） |
 
-安全提示：3proxy 配置为 `auth iponly` + `allow * *`，即**无认证**。请务必通过防火墙/安全组将 1080 端口限制为调度机 IP 可访问，否则等同于开放代理。
+安全提示：3proxy 默认配置为 `auth iponly` + `allow * *`，即**无认证**。请务必通过防火墙/安全组将 1080 端口限制为调度机 IP 可访问，否则等同于开放代理。也可开启用户名/密码认证（见「访问认证（可选）」），或两者叠加。
 
 ---
 
@@ -201,6 +202,44 @@ root@203.0.113.11
 | `BIND_IP` | 是 | — | SOCKS5 监听地址，host 网络下即宿主机出口 IP |
 | `OUT_IP` | 否 | 同 `BIND_IP` | 出口绑定地址 |
 | `PORT` | 否 | 1080 | 监听端口 |
+| `SOCKS_USER` | 否 | 空 | SOCKS5 用户名；与 `SOCKS_PASS` **同时提供**才启用密码认证 |
+| `SOCKS_PASS` | 否 | 空 | SOCKS5 密码（明文写入容器内配置，勿含双引号） |
+| `ALLOW_SRC` | 否 | `*` | 限定客户端来源 IP/网段（逗号分隔），启用密码后可叠加白名单 |
+
+### 访问认证（可选）
+
+默认 `auth iponly` + `allow * *`，即**无认证**。要开启用户名/密码认证，编辑 `agent/socks-credentials.env`：
+
+```
+SOCKS_USER=albert
+SOCKS_PASS=ChangeMe_StrongPass
+ALLOW_SRC=
+```
+
+两项都填即生效（`auth strong`），任一为空则自动回退为无认证模式，**不影响现有部署**。该文件已 gitignore，不会被提交。
+
+**改密码**（一次改动，全池生效）：
+
+```bash
+# 1. 本机编辑 agent/socks-credentials.env 的 SOCKS_PASS
+# 2. 一键下发到所有代理机并重建容器
+./deploy/deploy.sh
+
+# 若手工部署，则在每台代理机上：
+docker compose up -d --force-recreate
+```
+
+> HAProxy 无需改动：它是 TCP 透传 + 纯连接探测（`tcp-check connect`），不关心 SOCKS5 认证；容器重建期间的几秒中断会被健康检查自动剔除/恢复。密码走环境变量，**不需要重新构建镜像**。
+
+客户端连接：
+
+```bash
+curl --socks5-hostname albert:ChangeMe_StrongPass@<入口IP>:2080 http://ifconfig.me
+```
+
+Firefox 支持 SOCKS5 账号密码；Chrome/Edge 系统代理不支持，需借助本地转发工具。
+
+> 安全提示：SOCKS5 密码为明文传输，只能挡住端口扫描；请**保留防火墙/安全组白名单**，或填 `ALLOW_SRC` 限源，形成"密码 + 白名单"双保险。
 
 ### HAProxy 关键参数
 
@@ -240,6 +279,7 @@ for i in $(seq 1 8); do curl -s --socks5 proxy-pool.example.com:1080 http://ifco
 | 加机器 | `proxy-hosts.txt` 加行 → 重跑 `deploy/deploy.sh` |
 | 减机器 | `proxy-hosts.txt` 删行 → 重跑 `deploy/deploy.sh` |
 | 某台机器 IP 变更 | 该机器重跑 `generate-env.sh` + `docker compose up -d`，再重跑 `deploy.sh` 刷新后端 |
+| 改 SOCKS5 密码 | 编辑 `agent/socks-credentials.env` → 重跑 `deploy/deploy.sh`（HAProxy 无需改动） |
 | 单 IP 故障 | 无需干预，HAProxy 自动剔除并自动恢复 |
 | 查看后端状态 | `ssh -L 8404:127.0.0.1:8404` 后访问状态页 |
 
