@@ -280,6 +280,7 @@ for i in $(seq 1 8); do curl -s --socks5 proxy-pool.example.com:1080 http://ifco
 | 减机器 | `proxy-hosts.txt` 删行 → 重跑 `deploy/deploy.sh` |
 | 某台机器 IP 变更 | 该机器重跑 `generate-env.sh` + `docker compose up -d`，再重跑 `deploy.sh` 刷新后端 |
 | 改 SOCKS5 密码 | 编辑 `agent/socks-credentials.env` → 重跑 `deploy/deploy.sh`（HAProxy 无需改动） |
+| 重装 HAProxy 配置 | **调度机与代理机同机时必须带入口端口**：`sudo ENTRY_PORT=2080 ./scheduler/assemble-config.sh`。漏掉会写成 `bind *:1080`，与 3proxy 抢端口导致入口无监听（2080 上 `ss` 查不到、curl 报 Connection refused） |
 | 单 IP 故障 | 无需干预，HAProxy 自动剔除并自动恢复 |
 | 查看后端状态 | `ssh -L 8404:127.0.0.1:8404` 后访问状态页 |
 
@@ -288,8 +289,9 @@ for i in $(seq 1 8); do curl -s --socks5 proxy-pool.example.com:1080 http://ifco
 | 故障 | 影响 | 处理 |
 |------|------|------|
 | 调度机宕机 | 全池不可用 | 快速恢复，或做主备 |
-| 单机宕机 | 该机 32 个 IP 不可用 | HAProxy 自动剔除 |
+| 单机宕机 | 该机全部 IP 不可用 | HAProxy 自动剔除 |
 | 单 IP 故障 | 该 IP 不可用 | HAProxy 自动剔除 |
+| `up` 报 `container name "/proxy-XX" already in use` | 旧容器残留：compose 项目名=目录名，曾在别的目录（如 `/opt/proxy-pool/agent`）部署过的同名容器，当前项目的 `down` 看不见也删不掉 | `deploy.sh` 已内置自动清理（`down --remove-orphans` + 按名强删 `proxy-*`）；手工部署时先执行 `docker ps -aq --filter 'name=proxy-' \| xargs -r docker rm -f` 再 `up` |
 
 ---
 

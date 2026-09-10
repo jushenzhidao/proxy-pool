@@ -9,7 +9,9 @@
 #   PREBUILT=1 ./deploy.sh                               # 拉 ghcr.io 预构建镜像，不在远端 build
 #   PREBUILT=1 IMAGE_TAG=v1.0.0 ./deploy.sh              # 锁定镜像版本（默认 latest）
 #
-# 流程：远端检查 docker -> rsync agent/ -> 生成 .env 并重启容器 -> 拉回 IP 清单
+# 流程：远端检查 docker -> rsync agent/ -> 生成 .env 并清理旧容器后重启 -> 拉回 IP 清单
+#       （down --remove-orphans 清同项目孤儿；再按 proxy-* 名字强删，
+#        覆盖"曾在别的目录/项目部署过"留下的跨项目同名容器，避免 name 冲突）
 #       -> 生成 scheduler/haproxy-servers.cfg -> 本机若可写 /etc/haproxy 则自动组装+reload
 #
 # 幂等：重复执行即全量重部署（代理容器会短暂重启，秒级中断）
@@ -75,7 +77,8 @@ deploy_one() {
 
         echo "[$tag] generating env and restarting containers ..."
         ssh $SSH_OPTS "$target" "cd $REMOTE_DIR && ./generate-env.sh && \
-            (docker compose down --timeout 5 >/dev/null 2>&1 || true) && \
+            (docker compose down --timeout 5 --remove-orphans >/dev/null 2>&1 || true) && \
+            (docker ps -aq --filter 'name=proxy-' | xargs -r docker rm -f >/dev/null 2>&1 || true) && \
             export IMAGE_TAG='$IMAGE_TAG' && $UP_CMD" \
             || { echo "[$tag] FAIL: remote deploy failed"; return 1; }
 
