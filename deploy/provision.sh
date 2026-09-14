@@ -163,23 +163,37 @@ run_remote() { # auth host user pass port cmd
 # 的 ~/.bashrc 或登录横幅在非交互 ssh 时仍会输出内容（带 ANSI 颜色），scp 就会报
 # "Connection closed" / "protocol error" 而 ssh 命令本身却完全正常。
 # 用 ssh 'cat > file' < file 完全走 stdin，不依赖 SCP 协议，天然免疫该问题。
+#
+# 注意：传文件时【绝对不能用 -n】。SSH_BASE / SSH_COMMON 都带了 -n，所以这里要
+# 单独拼一个不包含 -n 的选项数组，否则本机 `cat < bootstrap.sh` 的 stdin 会被 -n 关掉，
+# 导致远端文件 0 字节。
 copy_bootstrap() { # auth host user pass port
     local auth="$1" host="$2" user="$3" pass="$4" port="$5" remote=/tmp/proxy-bootstrap.sh
+    local lck rck
+    lck=$(md5sum "$BOOTSTRAP" | awk '{print $1}')
+
+    # 上传：不能用 -n
+    local UP_OPTS=(-o LogLevel=ERROR -o StrictHostKeyChecking=accept-new
+                   -o UserKnownHostsFile="$HOME/.ssh/known_hosts"
+                   -o ConnectTimeout=10 -o NumberOfPasswordPrompts=1)
     if [ "$auth" = "key" ]; then
-        ssh "${SSH_BASE[@]}" -o BatchMode=yes -i "$PRIVKEY" -p "$port" "$user@$host" \
+        ssh "${UP_OPTS[@]}" -o BatchMode=yes -i "$PRIVKEY" -p "$port" "$user@$host" \
             "cat > $remote" < "$BOOTSTRAP" || return 1
-        # 校验：远端文件大小应与本地一致
-        local lsize rsize
-        lsize=$(wc -c < "$BOOTSTRAP" | tr -d '[:space:]')
-        rsize=$(ssh "${SSH_BASE[@]}" -o BatchMode=yes -i "$PRIVKEY" -p "$port" "$user@$host" \
-            "wc -c < $remote" </dev/null 2>/dev/null | strip_ansi | tail -1 | tr -d '[:space:]')
-        if [ -n "$rsize" ] && [ "$rsize" != "$lsize" ]; then
-            c_err "  文件校验失败：本地 $lsize 字节，远端 $rsize 字节"
-            return 1
-        fi
+        # 校验：远端 stdout 可能被 banner 污染，用 "RCK=md5" 标记过滤
+        rck=$(ssh "${UP_OPTS[@]}" -o BatchMode=yes -i "$PRIVKEY" -p "$port" "$user@$host" \
+              "printf 'RCK=%s\n' \$(md5sum $remote | awk '{print \$1}')" </dev/null 2>/dev/null \
+              | strip_ansi | sed -n 's/^RCK=//p' | tail -1 | tr -d '[:space:]')
     else
-        SSHPASS="$pass" sshpass -e ssh "${SSH_BASE[@]}" "${SSH_PASS_EXTRA[@]}" -p "$port" \
+        SSHPASS="$pass" sshpass -e ssh "${UP_OPTS[@]}" "${SSH_PASS_EXTRA[@]}" -p "$port" \
             "$user@$host" "cat > $remote" < "$BOOTSTRAP" || return 1
+        rck=$(SSHPASS="$pass" sshpass -e ssh "${UP_OPTS[@]}" "${SSH_PASS_EXTRA[@]}" -p "$port" \
+              "$user@$host" "printf 'RCK=%s\n' \$(md5sum $remote | awk '{print \$1}')" </dev/null 2>/dev/null \
+              | strip_ansi | sed -n 's/^RCK=//p' | tail -1 | tr -d '[:space:]')
+    fi
+
+    if [ -n "$rck" ] && [ "$rck" != "$lck" ]; then
+        c_err "  文件校验失败：本地 md5=$lck，远端 md5=$rck"
+        return 1
     fi
     return 0
 }
