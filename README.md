@@ -72,7 +72,7 @@ proxy-pool/
 │   └── haproxy-servers.cfg    # 生成物，已 gitignore
 ├── deploy/
 │   ├── deploy.sh              # 一键多机部署（并行 rsync + 拉真实 IP）
-│   ├── provision.sh           # 新机首次纳管（密码登录 → 装公钥/Docker/防火墙）
+│   ├── provision.sh           # 代理机纳管（装公钥 + Docker + 防火墙 + IP 自检）
 │   ├── bootstrap.sh           # 在新机上执行：IP 自检 + Docker + 防火墙
 │   ├── verify-egress.sh       # 逐个直连后端，验证登记的 IP 是否真能出网
 │   ├── hosts.txt.example      # 代理机唯一清单模板
@@ -198,8 +198,8 @@ machine1 203.0.113.1
 
 ```
 # 格式：<host|user@host> [user] [password] [port]
-#   · 有 password → provision.sh 首次纳管（装公钥 + Docker + 防火墙），之后永久免密
-#   · 无 password → 视为已免密，只参与部署（provision.sh 仅校验连通性）
+#   · 每行都会执行 bootstrap.sh（因为每行都是代理机），不只是新机
+#   · 认证方式自动探测：先试免密，通就全程用密钥；不通才用 password 走 sshpass
 #   · port 省略默认 22；# 开头/行尾注释、空行忽略
 root@203.0.113.11              # 已免密
 root@203.0.113.12 MyStrongPass # 待纳管
@@ -209,6 +209,9 @@ root@203.0.113.12 MyStrongPass # 待纳管
 要点：
 
 - **行即机器身份**：`provision.sh` 纳管成功后不再追加任何内容，清单由你手工维护，因此不会出现重复行 / 重复后端名。
+- **认证自动探测，密码不是必需的**：`provision.sh` 对每行先试免密（`~/.ssh/proxy_deploy`），**通就全程用密钥、完全不碰 sshpass**；只有免密不通时才用 `password` 字段登录一次装公钥。所以：
+  - 本机、已纳管过的机器写了密码也无所谓，脚本仍走密钥；
+  - 反过来，**Ubuntu 默认 `PermitRootLogin prohibit-password` 禁止 root 密码登录**，本机写密码是登不进去的——本机只能靠免密，别指望密码。
 - 纳管成功后**可删掉该行密码字段**（后续全走密钥），但**行必须保留**，否则 `deploy.sh` 认不出这台机器。
 - 端口与密钥也可由 `SSH_OPTS` 传入（全局生效）；非 22 端口建议直接写进 `~/.ssh/config`。
 - 含明文密码：`chmod 600`，已被 `.gitignore` 排除，勿入库。
@@ -304,6 +307,8 @@ for i in $(seq 1 8); do curl -s --socks5 proxy-pool.example.com:1080 http://ifco
 | 查看后端状态 | `ssh -L 8404:127.0.0.1:8404` 后访问状态页 |
 | 核对每个出口是否真能出网 | `./deploy/verify-egress.sh`（逐个直连后端，比对「登记的 IP」与「实测出网 IP」）；加 `ENTRY_HOST=<入口IP>` 顺带抽查入口轮询 |
 | 排除某个不想用作出口的 IP | 写进 `deploy/exclude-ips.txt`（一行一个），或 `EXCLUDE_IPS="1.2.3.4,5.6.7.8" ./deploy/deploy.sh` |
+| `provision.sh` 报「免密不通」 | 脚本会打印 **ssh 原始报错** + 对应处置建议（连不上 / 密钥不被接受 / 指纹变更 / 私钥不存在 / 密码登录被拒）。本机自连（`root@127.0.0.1`）最常见两个原因：① sshd 通过 `ListenAddress` 只绑了公网 IP，回环不通 → 把该行改成本机公网 IP；② `~/.ssh/config` 里配了非 22 的 `Port` → 新版已改为从 ssh_config 解析端口，老版会被 `-p 22` 覆盖 |
+| 本机（`root@127.0.0.1`）纳管失败 | 先确认免密：`ssh -o BatchMode=yes -i ~/.ssh/proxy_deploy root@127.0.0.1 'echo OK'`。**给本机写密码没用**——Ubuntu 默认禁止 root 密码登录；本机要走免密，把 `proxy_deploy.pub` 装进本机 `authorized_keys`（`cat ~/.ssh/proxy_deploy.pub >> ~/.ssh/authorized_keys`）即可 |
 
 故障影响：
 

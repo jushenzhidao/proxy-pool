@@ -1,11 +1,20 @@
 #!/usr/bin/env bash
 # =============================================================================
-# provision.sh —— 代理机「首次纳管」：用密码登录一次，装公钥 → 装 Docker → 放行端口
+# provision.sh —— 代理机「纳管」：装公钥 → 装 Docker → 放行端口 → 出口 IP 自检
 #
-# 与 deploy.sh 共用同一个清单 deploy/hosts.txt（代理机唯一清单）：
-#   · 行内有 password → 本脚本做首次纳管（装公钥/Docker/防火墙），之后永久免密
-#   · 行内无 password → 认为已免密，只做连通性校验（不纳管）
-# 纳管完成后【不会】再往清单里追加任何内容 —— 清单由你手工维护，天然不会重复。
+# 与 deploy.sh 共用同一份清单 deploy/hosts.txt（代理机唯一清单）。
+#
+# 认证方式自动探测（关键设计）：
+#   · 先试免密（~/.ssh/proxy_deploy）→ 通就全程用密钥，不用 sshpass
+#   · 不通才用清单里写的密码登录一次 → 装公钥 → 之后永久免密
+#   · 两者都不通 → 报错，并给出 ssh 原始输出 + 按错误类型的处置建议
+#
+#   所以「本机」「已纳管过的机器」即使写了密码也不会走 sshpass。这一点很重要：
+#   Ubuntu 默认 PermitRootLogin prohibit-password，**root 密码登录本就禁用**，
+#   本机写了密码也登不进去，只能靠免密。
+#
+# 清单里每一行都会执行 bootstrap.sh（因为每一行都是代理机），不只是新机。
+# 纳管完成后【不会】往清单里追加任何内容 —— 清单由你手工维护，天然不会重复。
 #
 # 用法（在运维机执行）：
 #   1) cp deploy/hosts.txt.example deploy/hosts.txt
@@ -22,7 +31,7 @@
 #   HOSTS_FILE=路径      # 自定义清单（默认 deploy/hosts.txt）
 #   PUBKEY/PRIVKEY       # 部署密钥路径（默认 ~/.ssh/proxy_deploy[.pub]）
 #
-# 依赖：sshpass（缺失时脚本会尝试自动安装）、ssh、scp
+# 依赖：ssh、scp；sshpass 仅在「确实需要用密码登录」时才要求（缺失时自动尝试安装）
 # =============================================================================
 set -uo pipefail
 
@@ -50,7 +59,7 @@ DO_DEPLOY=0
 for arg in "$@"; do
     case "$arg" in
         --deploy) DO_DEPLOY=1 ;;
-        -h|--help) sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,44p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "未知参数: $arg （可用：--deploy）" >&2; exit 2 ;;
     esac
 done
@@ -62,12 +71,18 @@ c_err()  { printf '\033[1;31m[provision]\033[0m %s\n' "$*" >&2; }
 
 # 密码走 SSHPASS 环境变量（sshpass -e），不出现在 ps/argv 里
 # -n：禁止 ssh 转发 stdin；没有它，循环里第一台机器的 ssh 会把清单剩余行当 stdin 吃掉
-SSH_BASE=(-o StrictHostKeyChecking=accept-new
-          -o UserKnownHostsFile="$HOME/.ssh/known_hosts"
-          -o ConnectTimeout=10
-          -o NumberOfPasswordPrompts=1
-          -o LogLevel=ERROR
-          -n)
+# 注意：-o 选项「先出现的值生效」，所以静默版必须把 LogLevel=ERROR 放在最前
+SSH_COMMON=(-o StrictHostKeyChecking=accept-new
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts"
+            -o ConnectTimeout=10
+            -o NumberOfPasswordPrompts=1
+            -n)
+SSH_BASE=(-o LogLevel=ERROR "${SSH_COMMON[@]}")   # 静默版：正常调用
+# 密码登录专用：关掉公钥认证，直接走 password/keyboard-interactive。
+# 否则 ssh 会先把本地所有密钥试一遍（agent 里钥匙多时尤其明显）才轮到密码，
+# 表现为 sshpass 密码明明对却还是失败。
+SSH_PASS_EXTRA=(-o PreferredAuthentications=password,keyboard-interactive
+                -o PubkeyAuthentication=no)
 SCP_BASE=(-q -o StrictHostKeyChecking=accept-new
           -o UserKnownHostsFile="$HOME/.ssh/known_hosts"
           -o ConnectTimeout=10)
@@ -94,50 +109,150 @@ ensure_sshpass() {
 
 ensure_keypair() {
     if [ ! -f "$PRIVKEY" ] || [ ! -f "$PUBKEY" ]; then
-        c_log "部署密钥不存在，生成 $PRIVKEY ..."
+        c_warn "部署密钥不存在，正在生成全新的 $PRIVKEY ..."
         mkdir -p "$(dirname "$PRIVKEY")"
         ssh-keygen -t ed25519 -f "$PRIVKEY" -N "" -C "proxy-pool-deploy" >/dev/null
+        c_warn "注意：这是【全新】密钥对，其公钥尚未被任何机器授权。"
+        c_warn "      凡清单里没写密码的行（依赖免密）都会失败——请给它们补上密码字段，"
+        c_warn "      或把 $PUBKEY 内容手工追加到各机 ~/.ssh/authorized_keys。"
     fi
     chmod 600 "$PRIVKEY" 2>/dev/null || true
 }
 
-# 用密码执行远端命令（stdin 接 /dev/null：sshpass 会转发 stdin，
-# 不隔离会把 while read 循环剩余的清单行吃掉）
-run_pass() { # host user pass port cmd
-    SSHPASS="$3" sshpass -e ssh "${SSH_BASE[@]}" -p "$4" "$2@$1" "$5" < /dev/null
+# ---------------------------------------------------------------------------
+# 认证探测与统一执行入口
+# ---------------------------------------------------------------------------
+
+# 探测可用认证方式：优先密钥，其次密码。打印 key|pass，都不通返回 1
+probe_auth() { # host user pass port
+    local host="$1" user="$2" pass="$3" port="$4"
+    if ssh "${SSH_BASE[@]}" -o BatchMode=yes -i "$PRIVKEY" -p "$port" "$user@$host" 'echo OK' \
+        </dev/null >/dev/null 2>&1; then
+        echo key; return 0
+    fi
+    [ -n "$pass" ] || return 1
+    ensure_sshpass >/dev/null 2>&1 || return 1
+    if SSHPASS="$pass" sshpass -e ssh "${SSH_BASE[@]}" "${SSH_PASS_EXTRA[@]}" -p "$port" \
+        "$user@$host" 'echo OK' </dev/null >/dev/null 2>&1; then
+        echo pass; return 0
+    fi
+    return 1
 }
 
-# 用密钥执行远端命令（BatchMode：还要密码就直接失败，不卡住）
-run_key() { # host user port cmd
-    ssh "${SSH_BASE[@]}" -o BatchMode=yes -i "$PRIVKEY" -p "$3" "$2@$1" "$4"
+# 按已探测到的认证方式执行远端命令
+run_remote() { # auth host user pass port cmd
+    local auth="$1" host="$2" user="$3" pass="$4" port="$5" cmd="$6"
+    if [ "$auth" = "key" ]; then
+        ssh "${SSH_BASE[@]}" -o BatchMode=yes -i "$PRIVKEY" -p "$port" "$user@$host" "$cmd" </dev/null
+    else
+        SSHPASS="$pass" sshpass -e ssh "${SSH_BASE[@]}" "${SSH_PASS_EXTRA[@]}" -p "$port" \
+            "$user@$host" "$cmd" </dev/null
+    fi
+}
+
+# 按认证方式传 bootstrap.sh
+copy_bootstrap() { # auth host user pass port
+    local auth="$1" host="$2" user="$3" pass="$4" port="$5"
+    if [ "$auth" = "key" ]; then
+        scp "${SCP_BASE[@]}" -i "$PRIVKEY" -P "$port" "$BOOTSTRAP" "$user@$host:/tmp/proxy-bootstrap.sh" </dev/null
+    else
+        SSHPASS="$pass" sshpass -e scp "${SCP_BASE[@]}" "${SSH_PASS_EXTRA[@]}" -P "$port" \
+            "$BOOTSTRAP" "$user@$host:/tmp/proxy-bootstrap.sh" </dev/null
+    fi
+}
+
+# 诊断版：不带 LogLevel=ERROR，把 ssh 的真实报错吐出来
+key_diag() { # host user port
+    ssh "${SSH_COMMON[@]}" -o BatchMode=yes -i "$PRIVKEY" -p "$3" "$2@$1" 'echo OK' </dev/null 2>&1
+}
+pass_diag() { # host user pass port
+    SSHPASS="$3" sshpass -e ssh "${SSH_COMMON[@]}" "${SSH_PASS_EXTRA[@]}" -p "$4" "$2@$1" 'echo OK' </dev/null 2>&1
+}
+
+explain_ssh_error() { # host port out mode
+    local host="$1" port="$2" out="$3" mode="$4"
+    case "$out" in
+        *"Connection refused"*|*"timed out"*|*"No route to host"*|*"Connection closed"*)
+            c_err "  -> 连不上 $host:$port。检查：sshd 是否监听该地址与端口"
+            c_err "     ss -lntp | grep ':$port'   /   grep -E '^(Port|ListenAddress)' /etc/ssh/sshd_config"
+            c_err "     本机自连(127.0.0.1)时：sshd 若只绑了公网 IP（ListenAddress），回环就连不上；可把清单里这行改成本机公网 IP" ;;
+        *"Permission denied"*|*"Authentication failed"*)
+            if [ "$mode" = "pass" ]; then
+                c_err "  -> 密码登录被拒。最常见原因：sshd 禁用了 root 密码登录"
+                c_err "     grep -E '^(PermitRootLogin|PasswordAuthentication)' /etc/ssh/sshd_config"
+                c_err "     Ubuntu 默认 'PermitRootLogin prohibit-password' —— root 只能用密钥，写密码无效。"
+                c_err "     修法二选一：① 给该机配好免密（推荐，本机就走这条）；"
+                c_err "                ② 改 'PermitRootLogin yes' + 'PasswordAuthentication yes' 后 systemctl restart sshd"
+                c_err "     另确认 root 密码本身存在：本机可用 'sudo passwd root' 设置"
+            else
+                c_err "  -> 密钥不被接受。检查：$PUBKEY 是否已写入该机 ~/.ssh/authorized_keys"
+                c_err "     sshd 的 PubkeyAuthentication yes / PermitRootLogin prohibit-password（不能是 no）"
+                c_err "     私钥 $PRIVKEY 权限须为 600；本机自连则检查 /root/.ssh/authorized_keys"
+            fi ;;
+        *"IDENTIFICATION HAS CHANGED"*|*"Offending"*|*"REMOTE HOST ID"*)
+            c_err "  -> known_hosts 里的主机指纹与当前不符。执行：ssh-keygen -R $host  然后重跑" ;;
+        *"no such identity"*|*"identity file"*)
+            c_err "  -> 私钥 $PRIVKEY 不存在。脚本本应自动生成，检查 ~/.ssh 是否可写" ;;
+        *)
+            c_err "  -> 见上方 ssh 原始报错" ;;
+    esac
 }
 
 # root 前缀：root 用户为空；非 root 且 NOPASSWD sudo 可用则 "sudo -n"；否则失败
-detect_sudo() { # host user pass port
-    local uid
-    uid=$(run_pass "$1" "$2" "$3" "$4" 'id -u' 2>/dev/null | tr -d '\r')
+detect_sudo() { # auth host user pass port
+    local auth="$1" host="$2" user="$3" pass="$4" port="$5" uid
+    uid=$(run_remote "$auth" "$host" "$user" "$pass" "$port" 'id -u' 2>/dev/null | tr -d '\r')
     if [ "$uid" = "0" ]; then echo ""; return 0; fi
-    if run_pass "$1" "$2" "$3" "$4" 'sudo -n true' >/dev/null 2>&1; then echo "sudo -n"; return 0; fi
+    if run_remote "$auth" "$host" "$user" "$pass" "$port" 'sudo -n true' >/dev/null 2>&1; then
+        echo "sudo -n"; return 0
+    fi
     return 1
 }
 
 # ---------------------------------------------------------------------------
-# 单台：首次纳管（清单里写了密码）
+# 单台纳管：先探测认证方式，再走完全相同的后续流程
 # ---------------------------------------------------------------------------
-provision_one() {
+provision_one() { # host user pass port
     local host="$1" user="$2" pass="$3" port="$4"
     local tag="$user@$host:$port"
-    local info uid os arch docker compose_ver sudo_prefix
+    local auth info uid os arch docker compose_ver sudo_prefix key
 
+    LAST_AUTH=""          # 由主循环读取，用于统计口径
     c_log "======== $tag ========"
 
-    # ① 连通性 + 采集信息
-    info=$(run_pass "$host" "$user" "$pass" "$port" \
+    # ① 探测认证方式：能用密钥就绝不用密码
+    auth=$(probe_auth "$host" "$user" "$pass" "$port")
+    if [ -z "$auth" ]; then
+        c_err "[$tag] 免密与密码两条路都不通。诊断信息："
+        local kout pout
+        kout=$(key_diag "$host" "$user" "$port")
+        c_err "  [密钥] $(printf '%s' "$kout" | head -3 | tr '\n' ' ')"
+        explain_ssh_error "$host" "$port" "$kout" key
+        if [ -n "$pass" ]; then
+            if ensure_sshpass >/dev/null 2>&1; then
+                pout=$(pass_diag "$host" "$user" "$pass" "$port")
+                c_err "  [密码] $(printf '%s' "$pout" | head -3 | tr '\n' ' ')"
+                explain_ssh_error "$host" "$port" "$pout" pass
+            else
+                c_err "  [密码] sshpass 不可用，无法尝试密码登录"
+            fi
+        else
+            c_err "  [密码] 清单该行未写密码，未尝试。"
+            c_err "     处置：补上密码字段后重跑，或先把 $PUBKEY 装到该机 ~/.ssh/authorized_keys"
+        fi
+        return 1
+    fi
+    LAST_AUTH="$auth"
+    [ "$auth" = "key" ] && c_ok "[$tag] 免密可用，全程走密钥（清单里的密码字段不再需要）" \
+                        || c_ok "[$tag] 免密不可用，已用密码登录，接下来装公钥"
+
+    # ② 采集信息
+    info=$(run_remote "$auth" "$host" "$user" "$pass" "$port" \
         'echo "UID=$(id -u)"; ( . /etc/os-release 2>/dev/null && echo "OS=$PRETTY_NAME" ) || echo "OS=unknown"; \
          echo "ARCH=$(uname -m)"; echo "HOST=$(hostname)"; \
          echo "DOCKER=$(command -v docker >/dev/null 2>&1 && docker --version || echo none)"; \
          echo "COMPOSE=$(docker compose version --short 2>/dev/null || echo none)"' 2>&1) \
-        || { c_err "[$tag] 登录失败：检查 IP/用户名/密码/端口是否正确，或 sshd 是否放行你的 IP"; return 1; }
+        || { c_err "[$tag] 执行远端命令失败：$info"; return 1; }
 
     uid=$(echo "$info"   | sed -n 's/^UID=//p'    | tr -d '\r')
     os=$(echo "$info"    | sed -n 's/^OS=//p'     | tr -d '\r')
@@ -147,8 +262,8 @@ provision_one() {
 
     c_ok "[$tag] 登录成功：$os / $arch / uid=$uid / docker=${docker:-none} / compose=${compose_ver:-none}"
 
-    # ② root 权限判定
-    sudo_prefix=$(detect_sudo "$host" "$user" "$pass" "$port")
+    # ③ root 权限判定
+    sudo_prefix=$(detect_sudo "$auth" "$host" "$user" "$pass" "$port")
     if [ $? -ne 0 ]; then
         c_err "[$tag] 该用户不是 root 且 sudo 需要密码。请改用 root 账号，或先配置 NOPASSWD sudo"
         return 1
@@ -158,43 +273,41 @@ provision_one() {
         c_warn "[$tag] 非 22 端口：deploy.sh 按清单里的主机直连 22 端口。请在运维机 ~/.ssh/config 里为该主机写 Port $port，否则部署阶段连不上"
     fi
 
-    # ③ 安装部署公钥（幂等：已存在则不重复追加）
-    local key
+    # ④ 安装部署公钥（幂等：已存在则不重复追加）
     key=$(cat "$PUBKEY")
-    run_pass "$host" "$user" "$pass" "$port" \
+    run_remote "$auth" "$host" "$user" "$pass" "$port" \
         "mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && \
          { grep -qF '$key' ~/.ssh/authorized_keys || printf '%s\n' '$key' >> ~/.ssh/authorized_keys; }" \
         || { c_err "[$tag] 写入 authorized_keys 失败"; return 1; }
 
-    # ④ 验证免密（BatchMode，还要密码就算失败）
-    if ! run_key "$host" "$user" "$port" 'echo OK' >/dev/null 2>&1; then
-        c_err "[$tag] 免密验证失败：公钥已写入但 key 认证不通过，检查远端 sshd 的 PubkeyAuthentication / PermitRootLogin"
-        return 1
+    # ⑤ 确认免密可用（走密码进来的，装完公钥后必须能免密）
+    if [ "$auth" != "key" ]; then
+        if ! ssh "${SSH_BASE[@]}" -o BatchMode=yes -i "$PRIVKEY" -p "$port" "$user@$host" 'echo OK' \
+            </dev/null >/dev/null 2>&1; then
+            local kout2
+            kout2=$(key_diag "$host" "$user" "$port")
+            c_err "[$tag] 公钥已写入，但免密验证仍不通过。ssh 原始报错："
+            printf '%s\n' "$kout2" | sed 's/^/       | /'
+            explain_ssh_error "$host" "$port" "$kout2" key
+            c_err "     免密不通则 deploy.sh 后续连不上该机，请修好再重跑"
+            return 1
+        fi
+        c_ok "[$tag] 免密已生效（后续可把该行密码字段删掉）"
+        auth=key   # 公钥既已生效，后续步骤改用密钥，不再依赖 sshpass
     fi
-    c_ok "[$tag] 免密已生效（后续可把该行密码字段删掉）"
 
-    # ⑤ 传输并执行 bootstrap.sh（Docker + compose + 防火墙 + 出口 IP 自检）
+    # ⑥ 传输并执行 bootstrap.sh（Docker + compose + 防火墙 + 出口 IP 自检）
     c_log "[$tag] 传输 bootstrap.sh 并执行系统层初始化 ..."
-    scp "${SCP_BASE[@]}" -i "$PRIVKEY" -P "$port" "$BOOTSTRAP" "$user@$host:/tmp/proxy-bootstrap.sh" \
+    copy_bootstrap "$auth" "$host" "$user" "$pass" "$port" \
         || { c_err "[$tag] scp 失败"; return 1; }
 
-    if ! run_key "$host" "$user" "$port" \
+    if ! run_remote "$auth" "$host" "$user" "$pass" "$port" \
         "$sudo_prefix env SCHED_IP='$SCHED_IP' CLIENT_IP='$CLIENT_IP' ENTRY_PORT='$ENTRY_PORT' SSH_PORT='$port' UFW_ENABLE='$UFW_ENABLE' bash /tmp/proxy-bootstrap.sh"; then
         c_err "[$tag] bootstrap.sh 执行失败（详情见上方输出）"
         return 1
     fi
     c_ok "[$tag] 系统层初始化完成"
     return 0
-}
-
-# 单台：已免密机器（清单里没写密码）——只校验，不纳管
-check_key_only() { # host user port
-    if run_key "$1" "$2" "$3" 'echo OK' >/dev/null 2>&1; then
-        c_ok "[$2@$1:$3] 已免密，无需纳管"
-        return 0
-    fi
-    c_err "[$2@$1:$3] 清单里没写密码，但免密不通：请补上密码字段重跑，或先手工配好公钥"
-    return 1
 }
 
 # ---------------------------------------------------------------------------
@@ -212,14 +325,14 @@ if [ -n "$perm" ] && [ "$perm" != "600" ]; then
     chmod 600 "$HOSTS_FILE"
 fi
 
-ensure_sshpass || exit 1
 ensure_keypair
 mkdir -p "$(dirname "$HOME/.ssh/known_hosts")"
 
 c_log "代理机清单：$HOSTS_FILE"
 c_log "调度机 IP：${SCHED_IP:-<未设置，1080 将不写来源限制>}    入口端口：$ENTRY_PORT"
 
-total=0; done_cnt=0; keyless_cnt=0; failed_list=()
+total=0; key_cnt=0; pass_cnt=0; failed_list=()
+LAST_AUTH=""
 # 清单从 fd 3 读：循环体内的 ssh/sshpass 即使抢 stdin 也影响不到 read
 while IFS= read -r -u 3 line || [ -n "$line" ]; do
     line="${line%$'\r'}"
@@ -230,11 +343,11 @@ while IFS= read -r -u 3 line || [ -n "$line" ]; do
     if [ "${h_field#*@}" != "$h_field" ]; then
         # 写法：user@host [password] [port]
         local_user="${h_field%@*}"; local_host="${h_field#*@}"
-        local_pass="${2:-}"; local_port="${3:-$DEFAULT_SSH_PORT}"
+        local_pass="${2:-}"; local_port="${3:-}"
     else
         # 写法：host [user] [password] [port]
         local_host="$1"; local_user="${2:-root}"
-        local_pass="${3:-}"; local_port="${4:-$DEFAULT_SSH_PORT}"
+        local_pass="${3:-}"; local_port="${4:-}"
     fi
 
     if [ -z "$local_host" ]; then
@@ -242,32 +355,36 @@ while IFS= read -r -u 3 line || [ -n "$line" ]; do
         continue
     fi
 
+    # 清单没写端口时，从 ssh_config 解析实际端口再连。
+    # 否则命令行上的 -p 22 会覆盖 ~/.ssh/config 里的 Port —— 这正是
+    # "改过 SSH 端口的机器 / 本机" 在 deploy.sh 里能连、在 provision.sh 里失败的原因。
+    if [ -z "$local_port" ]; then
+        local_port=$(ssh -G "$local_user@$local_host" 2>/dev/null | sed -n 's/^port //p' | head -1)
+    fi
+    [ -n "$local_port" ] || local_port="$DEFAULT_SSH_PORT"
+
     total=$((total + 1))
-    if [ -z "$local_pass" ]; then
-        if check_key_only "$local_host" "$local_user" "$local_port"; then
-            keyless_cnt=$((keyless_cnt + 1))
+    if provision_one "$local_host" "$local_user" "$local_pass" "$local_port"; then
+        if [ "$LAST_AUTH" = "key" ]; then
+            key_cnt=$((key_cnt + 1))
         else
-            failed_list+=("$local_user@$local_host:$local_port")
+            pass_cnt=$((pass_cnt + 1))
         fi
     else
-        if provision_one "$local_host" "$local_user" "$local_pass" "$local_port"; then
-            done_cnt=$((done_cnt + 1))
-        else
-            failed_list+=("$local_user@$local_host:$local_port")
-        fi
+        failed_list+=("$local_user@$local_host:$local_port")
     fi
 done 3< "$HOSTS_FILE"
 
 echo
 c_log "============ 纳管结果 ============"
-c_log "清单 $total 台：本次纳管 $done_cnt 台，已免密跳过 $keyless_cnt 台"
+c_log "清单 $total 台：免密纳管 $key_cnt 台，密码纳管 $pass_cnt 台"
 if [ "${#failed_list[@]}" -gt 0 ]; then
     c_err "失败 ${#failed_list[@]} 台：${failed_list[*]}"
 fi
 
-if [ "$done_cnt" -gt 0 ] || [ "$keyless_cnt" -gt 0 ]; then
+if [ "$pass_cnt" -gt 0 ] || [ "$key_cnt" -gt 0 ]; then
     echo
-    c_log "提示：纳管成功那行的密码字段可以删掉（后续全走密钥），但【行本身要保留】—— deploy.sh 靠它识别机器"
+    c_log "提示：密码纳管成功的那行，密码字段可以删掉（后续全走密钥），但【行本身要保留】—— deploy.sh 靠它识别机器"
     c_warn "安全提醒：$HOSTS_FILE 含明文密码，建议 chmod 600 且勿入库（.gitignore 已排除）"
 fi
 
