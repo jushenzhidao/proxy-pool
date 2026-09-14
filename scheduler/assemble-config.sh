@@ -61,7 +61,7 @@ sed -e 's/\r$//' -e 's/^[[:space:]]*//' haproxy-servers.cfg \
 DUP="$(awk '{print $2}' "$SERVERS_TMP" | sort | uniq -d)"
 if [ -n "$DUP" ]; then
     echo "ERROR: haproxy-servers.cfg 中存在重复的 server 名：$DUP" >&2
-    echo "       常见原因：proxy-hosts.txt 里同一地址写了两次（tag 相同）。修掉后重跑。" >&2
+    echo "       常见原因：deploy/hosts.txt 里同一台机器写了两行（tag 相同）。修掉后重跑。" >&2
     exit 1
 fi
 

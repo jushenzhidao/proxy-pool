@@ -72,7 +72,10 @@ proxy-pool/
 │   └── haproxy-servers.cfg    # 生成物，已 gitignore
 ├── deploy/
 │   ├── deploy.sh              # 一键多机部署（并行 rsync + 拉真实 IP）
-│   └── proxy-hosts.txt        # 代理机 SSH 清单
+│   ├── provision.sh           # 新机首次纳管（密码登录 → 装公钥/Docker/防火墙）
+│   ├── bootstrap.sh           # 在新机上执行：IP 自检 + Docker + 防火墙
+│   ├── hosts.txt.example      # 代理机唯一清单模板
+│   └── hosts.txt              # 代理机唯一清单（含明文密码，已 gitignore）
 ├── .github/workflows/
 │   └── release.yml            # push main 自动发版 + 推镜像到 ghcr.io
 └── docs/
@@ -100,12 +103,12 @@ proxy-pool/
 `deploy/deploy.sh` 会并行推送 `agent/` 到清单内所有机器、生成 `.env`、启动容器，并**拉取各机器真实出口 IP** 直接生成后端配置——不依赖"IP 连续"假设。
 
 ```bash
-# 1. 填写代理机清单
-cat > deploy/proxy-hosts.txt <<'EOF'
-root@203.0.113.11
-root@203.0.113.12
-root@203.0.113.13
+# 1. 填写代理机清单（deploy.sh / provision.sh 共用这一份）
+cat > deploy/hosts.txt <<'EOF'
+root@203.0.113.11            # 已免密：只参与部署
+root@203.0.113.12 MyPass     # 有密码：先纳管（装公钥/Docker/防火墙）再部署
 EOF
+chmod 600 deploy/hosts.txt
 
 # 2. 执行部署（非 22 端口或指定密钥时用 SSH_OPTS）
 SSH_OPTS="-p 2222 -i ~/.ssh/deploy_key" ./deploy/deploy.sh
@@ -186,14 +189,27 @@ machine1 203.0.113.1
 
 约定每台机器的 32 个出口 IP 从起始 IP 起连续递增，**起始 IP 的第四段不得大于 224**（否则跨 255 边界，脚本会报错退出）。走路径 A 时无需维护此文件。
 
-### `deploy/proxy-hosts.txt`
+### `deploy/hosts.txt`（代理机唯一清单）
+
+`deploy.sh` 与 `provision.sh` **共用这一份**。每行一台：
 
 ```
-# 一行一台，格式 [user@]host；# 开头为注释
-root@203.0.113.11
+# 格式：<host|user@host> [user] [password] [port]
+#   · 有 password → provision.sh 首次纳管（装公钥 + Docker + 防火墙），之后永久免密
+#   · 无 password → 视为已免密，只参与部署（provision.sh 仅校验连通性）
+#   · port 省略默认 22；# 开头/行尾注释、空行忽略
+root@203.0.113.11              # 已免密
+root@203.0.113.12 MyStrongPass # 待纳管
+203.0.113.13 root MyPass 2222  # 非 22 端口（另需在 ~/.ssh/config 写 Port）
 ```
 
-端口与密钥用 `SSH_OPTS` 传入，不写在文件里。
+要点：
+
+- **行即机器身份**：`provision.sh` 纳管成功后不再追加任何内容，清单由你手工维护，因此不会出现重复行 / 重复后端名。
+- 纳管成功后**可删掉该行密码字段**（后续全走密钥），但**行必须保留**，否则 `deploy.sh` 认不出这台机器。
+- 端口与密钥也可由 `SSH_OPTS` 传入（全局生效）；非 22 端口建议直接写进 `~/.ssh/config`。
+- 含明文密码：`chmod 600`，已被 `.gitignore` 排除，勿入库。
+- 旧版 `proxy-hosts.txt` 仍会被自动识别（找不到 `hosts.txt` 时回退），但建议合并到 `hosts.txt` 后删除。
 
 ### 容器环境变量
 
@@ -276,8 +292,8 @@ for i in $(seq 1 8); do curl -s --socks5 proxy-pool.example.com:1080 http://ifco
 
 | 场景 | 操作 |
 |------|------|
-| 加机器 | 新机先跑 `deploy/bootstrap.sh` 初始化（Docker/防火墙/IP 自检），再 `proxy-hosts.txt` 加行 → 重跑 `deploy/deploy.sh`，详见下方扩容 SOP |
-| 减机器 | `proxy-hosts.txt` 删行 → 重跑 `deploy/deploy.sh` |
+| 加机器 | `deploy/hosts.txt` 加一行（有密码就带上密码）→ `./deploy/provision.sh --deploy`，详见下方扩容 SOP |
+| 减机器 | `deploy/hosts.txt` 删行 → 重跑 `deploy/deploy.sh` |
 | 某台机器 IP 变更 | 该机器重跑 `generate-env.sh` + `docker compose up -d`，再重跑 `deploy.sh` 刷新后端 |
 | 改 SOCKS5 密码 | 编辑 `agent/socks-credentials.env` → 重跑 `deploy/deploy.sh`（HAProxy 无需改动） |
 | 重装 HAProxy 配置 | **调度机与代理机同机时必须带入口端口**：`sudo ENTRY_PORT=2080 ./scheduler/assemble-config.sh`。漏掉会写成 `bind *:1080`，与 3proxy 抢端口导致入口无监听（2080 上 `ss` 查不到、curl 报 Connection refused） |
@@ -295,49 +311,67 @@ for i in $(seq 1 8); do curl -s --socks5 proxy-pool.example.com:1080 http://ifco
 
 ---
 ## 加机器
-### 0. 只有密码时：一键纳管（推荐）
 
-新机还没免密时，`deploy/provision.sh` 用**密码登录一次**，自动完成「装公钥 → 免密 → Docker/compose → 防火墙 → 出口 IP 自检 → 加入清单」：
+### 1. 在唯一清单里加一行（`deploy/hosts.txt`）
 
 ```bash
-cp deploy/new-hosts.txt.example deploy/new-hosts.txt
-vi deploy/new-hosts.txt          # 每行一台：<host> <user> <password> [port]
-chmod 600 deploy/new-hosts.txt   # 含明文密码，勿入库（.gitignore 已排除）
+vi deploy/hosts.txt
+# 新机还没免密 → 带密码，provision.sh 会先纳管：
+#   root@198.51.100.10 MyStrongPass
+# 已免密 → 只写主机：
+#   root@198.51.100.11
+chmod 600 deploy/hosts.txt
+```
 
-SCHED_IP=<调度机IP> ./deploy/provision.sh            # 只做系统层纳管
+支持两种写法（`#` 注释、空行忽略）：
+
+```
+root@198.51.100.10 MyPass              # user@host pass（端口默认 22）
+198.51.100.11 root MyPass 2222         # host user pass port
+```
+
+### 2. 纳管 + 部署（一条命令）
+
+```bash
+SCHED_IP=<调度机IP> ./deploy/provision.sh            # 只纳管
 SCHED_IP=<调度机IP> ./deploy/provision.sh --deploy   # 纳管完立刻全量部署
 ```
 
-清单支持三种写法（`#` 注释、空行忽略）：
+脚本对每行机器的处理：
 
-```
-198.51.100.10 root MyPass              # host user pass（端口默认 22）
-198.51.100.11 root MyPass 2222         # 指定 SSH 端口
-root@198.51.100.12 MyPass              # user@host pass
-```
+| 清单行 | 行为 |
+|---|---|
+| 有密码 | 用密码登录一次 → 装公钥 → 验证免密 → 传 `bootstrap.sh` 并执行（Docker/compose + 防火墙 + 出口 IP 自检） |
+| 无密码 | 只做免密连通性校验；不通就报错提示"补密码字段或先配公钥" |
 
-脚本行为：每台独立处理、单台失败不影响其余；非 root 但有 NOPASSWD sudo 时自动 `sudo -n` 提权；已在 `proxy-hosts.txt` 里的机器不会重复追加。密码经 `SSHPASS` 环境变量传递（不出现在 `ps` 里），纳管完成后建议 `shred -u deploy/new-hosts.txt`。
+要点：每台独立处理，单台失败不影响其余；非 root 但有 NOPASSWD sudo 时自动 `sudo -n` 提权；纳管成功后**不再追加任何内容**（清单手工维护，天然不会重复）。密码经 `SSHPASS` 环境变量传递，不出现在 `ps` 里。
 
-> 依赖 `sshpass`（缺失时脚本自动尝试安装）。非 22 端口的主机请同时在运维机 `~/.ssh/config` 写 `Port`，否则后续 `deploy.sh` 连不上。
+> 依赖 `sshpass`（缺失时自动尝试安装）。非 22 端口的主机请同时在运维机 `~/.ssh/config` 写 `Port`，否则后续 `deploy.sh` 连不上。
 
-### 1. 分发密钥，调度机到代理机，无密码登录
-将代理机的IP新增到`deploy/proxy-hosts.txt`
+纳管成功后可以把该行密码字段删掉（后续全走密钥），但**行要保留**——`deploy.sh` 靠它识别机器。
+
+（可选）想手工分发公钥而不走 provision.sh：
+
 ```bash
-grep -vE '^\s*(#|$)' proxy-hosts.txt | while read -r h; do
+# 从 hosts.txt 取第一列（主机），逐台分发
+awk '!/^[[:space:]]*(#|$)/ {sub(/[[:space:]]*#.*$/,""); print $1}' deploy/hosts.txt | while read -r h; do
   ssh-copy-id -i ~/.ssh/proxy_deploy.pub "$h" < /dev/null
 done
 ```
 > `< /dev/null`：ssh 系命令会吞掉管道里循环剩余的 stdin，导致只装第一台。
-### 2. 验证无密码生效
+
+验证免密：
+
 ```bash
-grep -vE '^\s*(#|$)' proxy-hosts.txt | while read -r h; do
+awk '!/^[[:space:]]*(#|$)/ {sub(/[[:space:]]*#.*$/,""); print $1}' deploy/hosts.txt | while read -r h; do
   echo "== $h =="
   ssh -n -o BatchMode=yes -o ConnectTimeout=5 -i ~/.ssh/proxy_deploy "$h" 'echo OK $(hostname)'
 done
 ```
-### 3. 新机初始化（Docker / 防火墙 / IP 自检）
 
-新机器在加入清单前先做系统层初始化（在新机上以 root 执行）：
+### 3. 只做新机初始化（不纳管时用）
+
+想单独在新机上跑系统层初始化（在新机上以 root 执行）：
 
 ```bash
 scp deploy/bootstrap.sh root@新机IP:/root/
@@ -350,13 +384,11 @@ SCHED_IP=<调度机IP> ./bootstrap.sh
 
 云控制台安全组**手工**放行（脚本管不到）：TCP 1080 来源=调度机 IP；TCP 2080 来源=客户端 IP（仅兼调度机的机器）。
 
-### 4. 加入清单并部署（运维机）
+### 4. 部署（运维机）
 
 ```bash
-echo "root@新机IP" >> proxy-hosts.txt   # 追加，保留原有所有行
-SSH_OPTS="-i ~/.ssh/proxy_deploy"
-ENTRY_PORT=2080
-./deploy.sh
+ENTRY_PORT=2080 SSH_OPTS="-i ~/.ssh/proxy_deploy" ./deploy/deploy.sh
+# 或让 provision.sh 一条命令代劳：SCHED_IP=<调度机IP> ./deploy/provision.sh --deploy
 ```
 
 `deploy.sh` 已自动覆盖（新机无需手工做）：rsync `agent/`（含 `socks-credentials.env` 凭证，改密码只改本地仓库这份）→ 按本机 IP 数生成 compose → 容器重建 + 孤儿清理 → 重拉各机真实 IP 重写 `haproxy-servers.cfg` → reload。
@@ -381,6 +413,7 @@ curl --socks5-hostname chatfire:chatfirechatfire.@154.40.45.34:2080 http://ifcon
 2. **路径 B 要求 IP 连续。** 手工模式下后端 IP 由起始 IP 推算，不连续的实际 IP 会导致后端地址错误；请改用路径 A。
 3. **IP 扫描依赖 `ip` 命令。** 脚本会过滤 `127.`、`10.`、`192.168.`、`172.16-31.`、`169.254.` 网段，其余均视为公网 IP；若宿主机有其他非公网地址需手动调整 `.env`。
 4. **`.env` 与 `haproxy-servers.cfg` 不入库。** 二者含真实出口 IP，已在 `.gitignore` 中排除。
+5. **同一台机器在 `hosts.txt` 里只能写一行。** 后端名由主机名生成（`tag_of` 去掉 `user@` 后转义），同一台机器写两行会生成重复 server 名，`assemble-config.sh` 会拒绝写入并报 `存在重复的 server 名`。`deploy.sh` 会按主机名自动去重并打印 WARN。查重复：`awk '!/^[[:space:]]*(#|$)/ {sub(/[[:space:]]*#.*$/,""); sub(/^.*@/,"",$1); print $1}' deploy/hosts.txt | sort | uniq -d`
 
 ---
 

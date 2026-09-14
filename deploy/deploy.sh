@@ -3,7 +3,7 @@
 # 直接生成 HAProxy 后端配置（不依赖 machines.txt 的"IP 连续"假设）。
 #
 # 用法：
-#   ./deploy.sh                                        # 按 proxy-hosts.txt 全量部署
+#   ./deploy.sh                                        # 按 deploy/hosts.txt 全量部署
 #   SSH_OPTS="-p 2222 -i ~/.ssh/deploy_key" ./deploy.sh  # 自定义 SSH 参数
 #   REMOTE_DIR=/data/proxy-pool ./deploy.sh              # 自定义远程目录
 #   PREBUILT=1 ./deploy.sh                               # 拉 ghcr.io 预构建镜像，不在远端 build
@@ -19,11 +19,18 @@
 
 set -uo pipefail
 
+fail() { echo "ERROR: $*" >&2; exit 1; }
+
 DEPLOY_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$DEPLOY_DIR/.." && pwd)"
 AGENT_DIR="$REPO_ROOT/agent"
 SCHED_DIR="$REPO_ROOT/scheduler"
-HOSTS_FILE="$DEPLOY_DIR/proxy-hosts.txt"
+# 清单：统一用 hosts.txt（与 provision.sh 共用）；不存在时回退旧名 proxy-hosts.txt
+HOSTS_FILE="${HOSTS_FILE:-$DEPLOY_DIR/hosts.txt}"
+if [ ! -f "$HOSTS_FILE" ] && [ -f "$DEPLOY_DIR/proxy-hosts.txt" ]; then
+    echo "WARN: 未找到 $HOSTS_FILE，回退使用旧清单 $DEPLOY_DIR/proxy-hosts.txt（建议合并为 hosts.txt）" >&2
+    HOSTS_FILE="$DEPLOY_DIR/proxy-hosts.txt"
+fi
 REMOTE_DIR="${REMOTE_DIR:-/opt/proxy-pool}"
 IMAGE_TAG="${IMAGE_TAG:-latest}"
 case "$IMAGE_TAG" in
@@ -51,9 +58,26 @@ while IFS= read -r line; do
     line="${line%%#*}"
     line="${line%$'\r'}"
     line="$(echo "$line" | xargs 2>/dev/null || true)"
-    [ -n "$line" ] && TARGETS+=("$line")
+    [ -n "$line" ] && TARGETS+=("${line%% *}")   # 只取第一个字段：其后是 user/password/port
 done < "$HOSTS_FILE"
 [ "${#TARGETS[@]}" -gt 0 ] || fail "no targets found in $HOSTS_FILE"
+
+# ---- 同行去重：同一台机器只写一行（root@IP 与 IP 视为同一台）----
+# 不去重会导致后端出现重复 server 名（如 64-83-38-16i1 出现两次），
+# haproxy 语法校验直接失败、assemble-config.sh 拒绝写入。
+host_only() { local t="$1"; echo "${t##*@}"; }
+UNIQ_TARGETS=(); SEEN_HOSTS=""
+for t in "${TARGETS[@]}"; do
+    h="$(host_only "$t")"
+    case " $SEEN_HOSTS " in
+        *" $h "*)
+            echo "WARN: $HOSTS_FILE 中 $h 重复出现（写法不同也算重复，如 root@IP 与 IP），已跳过" >&2
+            continue ;;
+    esac
+    SEEN_HOSTS="$SEEN_HOSTS $h"
+    UNIQ_TARGETS+=("$t")
+done
+TARGETS=("${UNIQ_TARGETS[@]}")
 
 tag_of() { local t="$1"; t="${t##*@}"; echo "$t" | tr '.' '-'; }
 

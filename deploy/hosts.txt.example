@@ -1,0 +1,26 @@
+# 代理机唯一清单（deploy.sh 与 provision.sh 共用）
+#
+# 复制后填写：
+#   cp deploy/hosts.txt.example deploy/hosts.txt && chmod 600 deploy/hosts.txt
+#   vi deploy/hosts.txt
+#
+# 每行一台，字段以空格分隔：<host|user@host> [user] [password] [port]
+#   · 有 password → provision.sh 做首次纳管（装公钥 + Docker + 防火墙），之后永久免密
+#   · 无 password → 视为已免密，只校验连通性、不纳管
+#   · port 省略默认 22（非 22 端口请同时在运维机 ~/.ssh/config 里写 Port）
+#   · # 开头或行尾注释会被忽略，空行忽略
+#
+# 关键：行本身就是机器身份，纳管完【不会】自动追加任何内容，所以不存在重复行的问题。
+#       纳管成功后可以把密码字段删掉，但行一定要保留 —— deploy.sh 用它识别机器。
+#
+# ⚠️ 本文件含明文密码：chmod 600，且不要提交进 git（.gitignore 已排除 hosts.txt）
+
+# 示例：
+# 首次纳管（有密码）
+# root@198.51.100.10 MyStrongPass
+# root@198.51.100.11 MyPass 2222
+# 198.51.100.12 root MyPass
+#
+# 已纳管（无密码，只参与部署）
+# root@198.51.100.13
+# root@127.0.0.1        # 调度机本机（兼代理机）常用写法，走回环避免公网自访

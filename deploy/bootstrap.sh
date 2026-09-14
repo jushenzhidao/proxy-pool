@@ -66,13 +66,14 @@ fi
 cat <<'EOF'
 
 [bootstrap] 初始化完成。剩余步骤在【运维机】上执行：
-  1) 免密：  ssh-copy-id -i ~/.ssh/proxy_deploy.pub root@<本机IP>
-  2) 清单：  echo "root@<本机IP>" >> deploy/proxy-hosts.txt      # 追加，保留原有所有行
-  3) 部署：  ENTRY_PORT=2080 ./deploy/deploy.sh                  # 自动刷新 HAProxy 后端并 reload
-  4) 验证：  grep -vE '^[[:space:]]*(#|$)' deploy/proxy-hosts.txt | while read -r h; do
-               ssh -n -o BatchMode=yes -i ~/.ssh/proxy_deploy "$h" 'echo OK $(hostname)'
-             done
-             # 注意 ssh 必须带 -n，否则第一次连接会吞掉循环剩余的 stdin
+  1) 清单：  把本机加进 deploy/hosts.txt（唯一清单，与 deploy.sh 共用）
+             root@<本机IP> <密码>      # 有密码：provision.sh 会先纳管再部署
+             root@<本机IP>             # 已免密：只参与部署
+             注意：手工追加，不要写第二行（同一台机器只一行）
+  2) 纳管+部署： SCHED_IP=<调度机IP> ./deploy/provision.sh --deploy
+                 # 已免密的机器可跳过纳管，直接：ENTRY_PORT=2080 ./deploy/deploy.sh
+  3) 验证：   grep -c . deploy/hosts.txt
+               curl --socks5-hostname user:pass@<调度机IP>:2080 http://ifconfig.me
 
 [bootstrap] 云安全组提醒（云控制台手工配置，脚本管不到）：
   - 本机 TCP 1080：来源限调度机 IP（HAProxy 转发 + 健康检查）
