@@ -45,8 +45,6 @@ else
 fi
 SSH_OPTS="-o ConnectTimeout=10 ${SSH_OPTS:-}"   # shellcheck disable=SC2086
 
-fail() { echo "ERROR: $*" >&2; exit 1; }
-
 # ---- 可选：排除某些 IP，不进后端池 ----
 # 场景：机器上确实扫到了、但不想作为出口的 IP（管理口、回程未通的辅助 IP、临时网卡等）。
 # 两种写法任选其一（可同时用）：
@@ -136,8 +134,52 @@ deploy_one() {
         n=$(printf '%s\n' "$ips" | grep -c .)
         [ "$n" -gt 0 ] || { echo "[$tag] FAIL: no public IP found on $target"; return 1; }
 
-        printf '%s\n' "$ips" > "$RESULTS_DIR/$tag.ips"
-        echo "[$tag] OK: $n IPs exported"
+        # ---- 出口自检：逐 IP 验证「以该 IP 真的能出网」 ----
+        # 背景：generate-env.sh 只是 ip -4 -o addr 扫网卡，扫到不等于能出网。
+        #       辅助 IP 无回程路由、3proxy bind 失败、IP 已回收但仍在网卡上等场景下，
+        #       这些 IP 会被写进 HAProxy 后端，导致客户端轮询到它们时拿到
+        #       BAD REQUEST / 连接失败——而 deploy 却显示 PASS。
+        # 做法：远端用 curl --interface <ip> 直连检测站，回显 IP 与本 IP 一致才算通过。
+        # 关闭：VERIFY_EGRESS=0 ./deploy.sh（跳过自检，保留全部 IP）
+        : > "$RESULTS_DIR/$tag.bad"
+        if [ "${VERIFY_EGRESS:-1}" = "1" ]; then
+            echo "[$tag] verifying egress per IP ..."
+            ssh $SSH_OPTS "$target" \
+                "REMOTE_DIR='$REMOTE_DIR' CHECK_URL='${CHECK_URL:-http://ifconfig.me}' bash -s" \
+                > "$RESULTS_DIR/$tag.egress" 2>>"$log" <<'REMOTE_EGRESS' || true
+command -v curl >/dev/null 2>&1 || exit 0
+grep -E '^IP_[0-9]+=' "$REMOTE_DIR/.env" | cut -d= -f2 | while read -r ip; do
+    [ -n "$ip" ] || continue
+    got=$(curl -s --max-time 8 --interface "$ip" "$CHECK_URL" 2>/dev/null | tr -d '[:space:]')
+    if [ "$got" = "$ip" ]; then
+        printf '%s\tOK\n' "$ip"
+    else
+        printf '%s\tBAD:%s\n' "$ip" "${got:-no-response}"
+    fi
+done
+REMOTE_EGRESS
+            # 检出结果非空才据此过滤（远端没装 curl 时不误伤）
+            if [ -s "$RESULTS_DIR/$tag.egress" ]; then
+                : > "$RESULTS_DIR/$tag.ips"
+                while IFS=$'\t' read -r ip st; do
+                    [ -n "$ip" ] || continue
+                    if [ "$st" = "OK" ]; then
+                        printf '%s\n' "$ip" >> "$RESULTS_DIR/$tag.ips"
+                    else
+                        printf '%s(%s)\n' "$ip" "${st#BAD:}" >> "$RESULTS_DIR/$tag.bad"
+                    fi
+                done < "$RESULTS_DIR/$tag.egress"
+                # 整台机器所有出口都不通 -> 视为部署失败，避免把坏节点塞进后端池
+                if [ ! -s "$RESULTS_DIR/$tag.ips" ]; then
+                    echo "[$tag] FAIL: 所有出口 IP 自检未通过"
+                    return 1
+                fi
+            else
+                printf '%s\n' "$ips" > "$RESULTS_DIR/$tag.ips"
+            fi
+        else
+            printf '%s\n' "$ips" > "$RESULTS_DIR/$tag.ips"
+        fi
         return 0
     } > "$log" 2>&1
 }
@@ -183,6 +225,7 @@ TOTAL=$(grep -c . "$OUT" 2>/dev/null || echo 0)
 echo
 echo "Summary: $OK machine(s) OK, $FAILED failed, $TOTAL backends -> $OUT"
 [ "$EXC" -gt 0 ] && echo "         ($EXC 个 IP 被 EXCLUDE_IPS / exclude-ips.txt 排除，未写入后端)"
+[ "$BAD_N" -eq 0 ] || echo "         ($BAD_N 台机器有出口 IP 自检不通，已自动剔除，见上方「自检不通已剔除」)"
 [ "$FAILED" -eq 0 ] || { echo "Fix the failures above, then re-run."; exit 1; }
 [ "$TOTAL" -gt 0 ] || fail "no backends generated"
 

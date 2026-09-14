@@ -128,6 +128,9 @@ PREBUILT=1 IMAGE_TAG=v1.0.0 ./deploy/deploy.sh   # 锁定版本，默认 latest
 
 脚本会输出 `Summary: N machine(s) OK, 0 failed, M backends`。若本机 `/etc/haproxy` 可写，会自动执行 `assemble-config.sh` 并 `systemctl reload haproxy`；否则打印需要手动执行的命令。
 
+> **PASS 的含义（重要）**：新版 `deploy.sh` 会在每台机器上做**出口自检**——对每个扫到的 IP 用 `curl --interface <ip>` 直连检测站，回显 IP 与本 IP 一致才写进后端；不一致的行会打印 `自检不通已剔除: IP(原因)` 并不入池，整机都不通则判 FAIL。关闭自检：`VERIFY_EGRESS=0 ./deploy.sh`，换检测站：`CHECK_URL=https://api.ipify.org ./deploy.sh`。
+> 若你用的是**修改前**的旧脚本，PASS 只代表"rsync + `compose up` 退出码 0 + 扫到了 IP"，**不代表这些 IP 能出网**，坏 IP 会混进后端池。
+
 重复执行即全量重部署（代理容器会短暂重启，秒级中断）。
 
 ### 非 32 IP 机器（少卡机器）
@@ -268,7 +271,8 @@ Firefox 支持 SOCKS5 账号密码；Chrome/Edge 系统代理不支持，需借�
 - `balance roundrobin`：轮询分发
 - `tcp-check connect port 1080` + `check inter 3s fall 3 rise 2`：3 秒探测、连续 3 次失败剔除、连续 2 次成功恢复
 - `maxconn 100000`，`timeout client/server 300s`
-- 状态页监听 `127.0.0.1:8404`（`listen stats` 段必须保持在配置最前，后端 server 行追加在文件末尾）。远程查看：
+- `option redispatch`：连接失败时重投到其它后端，避免恰好命中刚 DOWN 的节点
+- 状态页监听 `127.0.0.1:8404`（`listen stats` 段必须保持在配置最前，后端 server 行追加在文件末尾）。**该段必须显式 `mode http`**——`defaults` 是 `mode tcp`，否则 `stats` 被静默忽略（配置校验会报 `stats statement ignored ... requires HTTP mode`，页面永远打不开）。远程查看：
 
 ```bash
 ssh -L 8404:127.0.0.1:8404 <调度机>   # 然后访问 http://127.0.0.1:8404/stats
@@ -309,6 +313,7 @@ for i in $(seq 1 8); do curl -s --socks5 proxy-pool.example.com:1080 http://ifco
 | 排除某个不想用作出口的 IP | 写进 `deploy/exclude-ips.txt`（一行一个），或 `EXCLUDE_IPS="1.2.3.4,5.6.7.8" ./deploy/deploy.sh` |
 | `provision.sh` 报「免密不通」 | 脚本会打印 **ssh 原始报错** + 对应处置建议（连不上 / 密钥不被接受 / 指纹变更 / 私钥不存在 / 密码登录被拒）。本机自连（`root@127.0.0.1`）最常见两个原因：① sshd 通过 `ListenAddress` 只绑了公网 IP，回环不通 → 把该行改成本机公网 IP；② `~/.ssh/config` 里配了非 22 的 `Port` → 新版已改为从 ssh_config 解析端口，老版会被 `-p 22` 覆盖 |
 | 本机（`root@127.0.0.1`）纳管失败 | 先确认免密：`ssh -o BatchMode=yes -i ~/.ssh/proxy_deploy root@127.0.0.1 'echo OK'`。**给本机写密码没用**——Ubuntu 默认禁止 root 密码登录；本机要走免密，把 `proxy_deploy.pub` 装进本机 `authorized_keys`（`cat ~/.ssh/proxy_deploy.pub >> ~/.ssh/authorized_keys`）即可 |
+| `scp: Connection closed` / uid 被识别成非 root | 远端**非交互 shell 输出了额外内容**（登录横幅、`.bashrc` 里的 echo）。SCP 协议对 stdout 上的杂散字节零容忍，会直接断连；横幅还会污染 `id -u` 的解析。本脚本已改用 `ssh 'cat > file' < file` 传文件（不经 SCP 协议，并在解析前清理 ANSI 转义），仍失败则根治：让远端 `~/.bashrc` 在非交互时直接 return（Ubuntu 默认模板已带 `case $- in *i*) ;; *) return;; esac`） |
 
 故障影响：
 

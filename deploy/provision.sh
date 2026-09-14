@@ -72,11 +72,15 @@ c_err()  { printf '\033[1;31m[provision]\033[0m %s\n' "$*" >&2; }
 # 密码走 SSHPASS 环境变量（sshpass -e），不出现在 ps/argv 里
 # -n：禁止 ssh 转发 stdin；没有它，循环里第一台机器的 ssh 会把清单剩余行当 stdin 吃掉
 # 注意：-o 选项「先出现的值生效」，所以静默版必须把 LogLevel=ERROR 放在最前
-SSH_COMMON=(-o StrictHostKeyChecking=accept-new
-            -o UserKnownHostsFile="$HOME/.ssh/known_hosts"
-            -o ConnectTimeout=10
-            -o NumberOfPasswordPrompts=1
-            -n)
+#
+# SSH_OPTS 与 SSH_COMMON 的区别是【有没有 -n】：
+#   · 绝大多数调用要 -n（禁止 ssh 转发 stdin，否则会吃掉 while read 的清单）
+#   · 但「用 ssh 传文件内容」的场景必须【不要】-n —— 那时 stdin 就是文件内容
+SSH_OPTS=(-o StrictHostKeyChecking=accept-new
+          -o UserKnownHostsFile="$HOME/.ssh/known_hosts"
+          -o ConnectTimeout=10
+          -o NumberOfPasswordPrompts=1)
+SSH_COMMON=(-n "${SSH_OPTS[@]}")
 SSH_BASE=(-o LogLevel=ERROR "${SSH_COMMON[@]}")   # 静默版：正常调用
 # 密码登录专用：关掉公钥认证，直接走 password/keyboard-interactive。
 # 否则 ssh 会先把本地所有密钥试一遍（agent 里钥匙多时尤其明显）才轮到密码，
@@ -86,6 +90,9 @@ SSH_PASS_EXTRA=(-o PreferredAuthentications=password,keyboard-interactive
 SCP_BASE=(-q -o StrictHostKeyChecking=accept-new
           -o UserKnownHostsFile="$HOME/.ssh/known_hosts"
           -o ConnectTimeout=10)
+
+# 清理 ANSI 转义序列（很多服务器的登录横幅带颜色，会污染非交互 ssh 的输出）
+strip_ansi() { sed 's/\x1b\[[0-9;?]*[a-zA-Z]//g' | tr -d '\r'; }
 
 # ---------------------------------------------------------------------------
 # 前置检查
@@ -150,15 +157,31 @@ run_remote() { # auth host user pass port cmd
     fi
 }
 
-# 按认证方式传 bootstrap.sh
+# 传 bootstrap.sh：用「ssh + stdin 重定向」而不是 scp。
+#
+# 为什么不用 scp：scp 走的 SCP/SFTP 协议对 stdout 上的杂散字节零容忍。很多服务器
+# 的 ~/.bashrc 或登录横幅在非交互 ssh 时仍会输出内容（带 ANSI 颜色），scp 就会报
+# "Connection closed" / "protocol error" 而 ssh 命令本身却完全正常。
+# 用 ssh 'cat > file' < file 完全走 stdin，不依赖 SCP 协议，天然免疫该问题。
 copy_bootstrap() { # auth host user pass port
-    local auth="$1" host="$2" user="$3" pass="$4" port="$5"
+    local auth="$1" host="$2" user="$3" pass="$4" port="$5" remote=/tmp/proxy-bootstrap.sh
     if [ "$auth" = "key" ]; then
-        scp "${SCP_BASE[@]}" -i "$PRIVKEY" -P "$port" "$BOOTSTRAP" "$user@$host:/tmp/proxy-bootstrap.sh" </dev/null
+        ssh "${SSH_BASE[@]}" -o BatchMode=yes -i "$PRIVKEY" -p "$port" "$user@$host" \
+            "cat > $remote" < "$BOOTSTRAP" || return 1
+        # 校验：远端文件大小应与本地一致
+        local lsize rsize
+        lsize=$(wc -c < "$BOOTSTRAP" | tr -d '[:space:]')
+        rsize=$(ssh "${SSH_BASE[@]}" -o BatchMode=yes -i "$PRIVKEY" -p "$port" "$user@$host" \
+            "wc -c < $remote" </dev/null 2>/dev/null | strip_ansi | tail -1 | tr -d '[:space:]')
+        if [ -n "$rsize" ] && [ "$rsize" != "$lsize" ]; then
+            c_err "  文件校验失败：本地 $lsize 字节，远端 $rsize 字节"
+            return 1
+        fi
     else
-        SSHPASS="$pass" sshpass -e scp "${SCP_BASE[@]}" "${SSH_PASS_EXTRA[@]}" -P "$port" \
-            "$BOOTSTRAP" "$user@$host:/tmp/proxy-bootstrap.sh" </dev/null
+        SSHPASS="$pass" sshpass -e ssh "${SSH_BASE[@]}" "${SSH_PASS_EXTRA[@]}" -p "$port" \
+            "$user@$host" "cat > $remote" < "$BOOTSTRAP" || return 1
     fi
+    return 0
 }
 
 # 诊断版：不带 LogLevel=ERROR，把 ssh 的真实报错吐出来
@@ -199,13 +222,17 @@ explain_ssh_error() { # host port out mode
 }
 
 # root 前缀：root 用户为空；非 root 且 NOPASSWD sudo 可用则 "sudo -n"；否则失败
+#   uid 用带标记的输出（PPUID=）而不是裸 `id -u`：远端 shell 若输出横幅，裸输出
+#   取最后一行仍可能是横幅；带标记则只认 PPUID= 那一行。
 detect_sudo() { # auth host user pass port
     local auth="$1" host="$2" user="$3" pass="$4" port="$5" uid
-    uid=$(run_remote "$auth" "$host" "$user" "$pass" "$port" 'id -u' 2>/dev/null | tr -d '\r')
+    uid=$(run_remote "$auth" "$host" "$user" "$pass" "$port" 'printf "PPUID=%s\n" "$(id -u)"' 2>/dev/null \
+          | strip_ansi | sed -n 's/^PPUID=//p' | tail -1 | tr -d '[:space:]')
     if [ "$uid" = "0" ]; then echo ""; return 0; fi
     if run_remote "$auth" "$host" "$user" "$pass" "$port" 'sudo -n true' >/dev/null 2>&1; then
         echo "sudo -n"; return 0
     fi
+    [ -z "$uid" ] && c_err "  另：未能识别远端 uid（输出被污染？检查远端 ~/.bashrc 非交互时是否直接 return）"
     return 1
 }
 
@@ -253,12 +280,22 @@ provision_one() { # host user pass port
          echo "DOCKER=$(command -v docker >/dev/null 2>&1 && docker --version || echo none)"; \
          echo "COMPOSE=$(docker compose version --short 2>/dev/null || echo none)"' 2>&1) \
         || { c_err "[$tag] 执行远端命令失败：$info"; return 1; }
+    info=$(printf '%s\n' "$info" | strip_ansi)
 
-    uid=$(echo "$info"   | sed -n 's/^UID=//p'    | tr -d '\r')
-    os=$(echo "$info"    | sed -n 's/^OS=//p'     | tr -d '\r')
-    arch=$(echo "$info"  | sed -n 's/^ARCH=//p'   | tr -d '\r')
-    docker=$(echo "$info" | sed -n 's/^DOCKER=//p' | tr -d '\r')
-    compose_ver=$(echo "$info" | sed -n 's/^COMPOSE=//p' | tr -d '\r')
+    uid=$(printf '%s\n' "$info" | sed -n 's/^UID=//p'     | tail -1 | tr -d '[:space:]')
+    os=$(printf '%s\n' "$info"  | sed -n 's/^OS=//p'      | tail -1)
+    arch=$(printf '%s\n' "$info" | sed -n 's/^ARCH=//p'   | tail -1 | tr -d '[:space:]')
+    docker=$(printf '%s\n' "$info" | sed -n 's/^DOCKER=//p' | tail -1)
+    compose_ver=$(printf '%s\n' "$info" | sed -n 's/^COMPOSE=//p' | tail -1 | tr -d '[:space:]')
+
+    # 远端非交互 shell 若输出了额外内容（登录横幅、.bashrc 的 echo 等），
+    # 会污染输出解析，还会让 scp 断连。检测到就提示，避免用户一头雾水。
+    case "$uid" in
+        ''|*[!0-9]*)
+            c_warn "[$tag] 未能识别远端 uid（得到 '${uid:-<空>}'）。多半是该机非交互 shell 输出了额外内容："
+            printf '%s\n' "$info" | head -5 | sed 's/^/       | /'
+            c_warn "     检查远端 ~/.bashrc 是否有 echo/横幅，并确保非交互时直接 return；本脚本已改用 stdin 传文件，不受影响" ;;
+    esac
 
     c_ok "[$tag] 登录成功：$os / $arch / uid=$uid / docker=${docker:-none} / compose=${compose_ver:-none}"
 
