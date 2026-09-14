@@ -276,7 +276,7 @@ for i in $(seq 1 8); do curl -s --socks5 proxy-pool.example.com:1080 http://ifco
 
 | 场景 | 操作 |
 |------|------|
-| 加机器 | `proxy-hosts.txt` 加行 → 重跑 `deploy/deploy.sh` |
+| 加机器 | 新机先跑 `deploy/bootstrap.sh` 初始化（Docker/防火墙/IP 自检），再 `proxy-hosts.txt` 加行 → 重跑 `deploy/deploy.sh`，详见下方扩容 SOP |
 | 减机器 | `proxy-hosts.txt` 删行 → 重跑 `deploy/deploy.sh` |
 | 某台机器 IP 变更 | 该机器重跑 `generate-env.sh` + `docker compose up -d`，再重跑 `deploy.sh` 刷新后端 |
 | 改 SOCKS5 密码 | 编辑 `agent/socks-credentials.env` → 重跑 `deploy/deploy.sh`（HAProxy 无需改动） |
@@ -294,6 +294,86 @@ for i in $(seq 1 8); do curl -s --socks5 proxy-pool.example.com:1080 http://ifco
 | `up` 报 `container name "/proxy-XX" already in use` | 旧容器残留：compose 项目名=目录名，曾在别的目录（如 `/opt/proxy-pool/agent`）部署过的同名容器，当前项目的 `down` 看不见也删不掉 | `deploy.sh` 已内置自动清理（`down --remove-orphans` + 按名强删 `proxy-*`）；手工部署时先执行 `docker ps -aq --filter 'name=proxy-' \| xargs -r docker rm -f` 再 `up` |
 
 ---
+## 加机器
+### 0. 只有密码时：一键纳管（推荐）
+
+新机还没免密时，`deploy/provision.sh` 用**密码登录一次**，自动完成「装公钥 → 免密 → Docker/compose → 防火墙 → 出口 IP 自检 → 加入清单」：
+
+```bash
+cp deploy/new-hosts.txt.example deploy/new-hosts.txt
+vi deploy/new-hosts.txt          # 每行一台：<host> <user> <password> [port]
+chmod 600 deploy/new-hosts.txt   # 含明文密码，勿入库（.gitignore 已排除）
+
+SCHED_IP=<调度机IP> ./deploy/provision.sh            # 只做系统层纳管
+SCHED_IP=<调度机IP> ./deploy/provision.sh --deploy   # 纳管完立刻全量部署
+```
+
+清单支持三种写法（`#` 注释、空行忽略）：
+
+```
+198.51.100.10 root MyPass              # host user pass（端口默认 22）
+198.51.100.11 root MyPass 2222         # 指定 SSH 端口
+root@198.51.100.12 MyPass              # user@host pass
+```
+
+脚本行为：每台独立处理、单台失败不影响其余；非 root 但有 NOPASSWD sudo 时自动 `sudo -n` 提权；已在 `proxy-hosts.txt` 里的机器不会重复追加。密码经 `SSHPASS` 环境变量传递（不出现在 `ps` 里），纳管完成后建议 `shred -u deploy/new-hosts.txt`。
+
+> 依赖 `sshpass`（缺失时脚本自动尝试安装）。非 22 端口的主机请同时在运维机 `~/.ssh/config` 写 `Port`，否则后续 `deploy.sh` 连不上。
+
+### 1. 分发密钥，调度机到代理机，无密码登录
+将代理机的IP新增到`deploy/proxy-hosts.txt`
+```bash
+grep -vE '^\s*(#|$)' proxy-hosts.txt | while read -r h; do
+  ssh-copy-id -i ~/.ssh/proxy_deploy.pub "$h" < /dev/null
+done
+```
+> `< /dev/null`：ssh 系命令会吞掉管道里循环剩余的 stdin，导致只装第一台。
+### 2. 验证无密码生效
+```bash
+grep -vE '^\s*(#|$)' proxy-hosts.txt | while read -r h; do
+  echo "== $h =="
+  ssh -n -o BatchMode=yes -o ConnectTimeout=5 -i ~/.ssh/proxy_deploy "$h" 'echo OK $(hostname)'
+done
+```
+### 3. 新机初始化（Docker / 防火墙 / IP 自检）
+
+新机器在加入清单前先做系统层初始化（在新机上以 root 执行）：
+
+```bash
+scp deploy/bootstrap.sh root@新机IP:/root/
+ssh root@新机IP
+SCHED_IP=<调度机IP> ./bootstrap.sh
+# 本机兼调度机时再加 CLIENT_IP=<客户端IP>；ufw 需启用时加 UFW_ENABLE=1
+```
+
+脚本做四件事：出口 IP 自检（多 IP 必须已写入网卡，云控制台"绑定"不算）→ 安装 Docker + compose 插件 → 写 ufw 规则（1080 仅放行调度机）→ 打印后续步骤。
+
+云控制台安全组**手工**放行（脚本管不到）：TCP 1080 来源=调度机 IP；TCP 2080 来源=客户端 IP（仅兼调度机的机器）。
+
+### 4. 加入清单并部署（运维机）
+
+```bash
+echo "root@新机IP" >> proxy-hosts.txt   # 追加，保留原有所有行
+SSH_OPTS="-i ~/.ssh/proxy_deploy"
+ENTRY_PORT=2080
+./deploy.sh
+```
+
+`deploy.sh` 已自动覆盖（新机无需手工做）：rsync `agent/`（含 `socks-credentials.env` 凭证，改密码只改本地仓库这份）→ 按本机 IP 数生成 compose → 容器重建 + 孤儿清理 → 重拉各机真实 IP 重写 `haproxy-servers.cfg` → reload。
+
+### 5. 验证
+
+```bash
+curl --socks5-hostname user:pass@<调度机IP>:2080 http://ifconfig.me
+# 连发多次，新机 IP 应进入轮询；后端健康看 http://127.0.0.1:8404/stats
+```
+curl --socks5-hostname chatfire:chatfirechatfire.@154.40.45.34:2080 http://ifconfig.me
+# 用域名入口时（A 记录指向调度机）：主机名处**不能**加 http(s):// 前缀，直接写 host:port
+# curl --socks5-hostname chatfire:chatfirechatfire.@proxy.example.com:2080 http://ifconfig.me
+### 关于宝塔面板
+
+- 代理机**建议不装宝塔**：只需要 Docker，装面板徒增攻击面，且防火墙有两套管理体系容易打架。
+- 机器自带/必须用宝塔时：端口放行**只在一处配置**（宝塔"安全"页或 ufw，二选一）；宝塔占用的 80/443/8888 与本项目 1080/2080 无冲突；凭证下发与容器生命周期仍全部走 `deploy.sh` / docker 命令，不经宝塔。
 
 ## 已知约束
 

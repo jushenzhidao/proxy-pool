@@ -49,13 +49,34 @@ backend proxies
     tcp-check connect port 1080
 EOF
 
-cat haproxy-servers.cfg >> /etc/haproxy/haproxy.cfg
+# ---- 规范化后端清单：容忍 Windows 换行（CRLF）与多余缩进，统一 4 空格缩进 ----
+SERVERS_TMP="$(mktemp)"
+trap 'rm -f "$SERVERS_TMP"' EXIT
 
-# 有 haproxy 二进制时先校验语法，避免坏配置被 reload 上去
+sed -e 's/\r$//' -e 's/^[[:space:]]*//' haproxy-servers.cfg \
+    | grep -vE '^($|#)' \
+    | sed 's/^/    /' > "$SERVERS_TMP"
+
+# server 名在同一 backend 内必须唯一，重复会导致 haproxy -c 校验失败（reload 报 status=1）
+DUP="$(awk '{print $2}' "$SERVERS_TMP" | sort | uniq -d)"
+if [ -n "$DUP" ]; then
+    echo "ERROR: haproxy-servers.cfg 中存在重复的 server 名：$DUP" >&2
+    echo "       常见原因：proxy-hosts.txt 里同一地址写了两次（tag 相同）。修掉后重跑。" >&2
+    exit 1
+fi
+
+BACKENDS="$(grep -cE '^[[:space:]]*server ' "$SERVERS_TMP" || true)"
+[ "$BACKENDS" -gt 0 ] || { echo "ERROR: 后端清单为空（无有效 server 行）" >&2; exit 1; }
+
+cat "$SERVERS_TMP" >> /etc/haproxy/haproxy.cfg
+
+# 有 haproxy 二进制时先校验语法，避免坏配置被 reload 上去（不静默，报错要能看到行号）
 if command -v haproxy >/dev/null 2>&1; then
-    haproxy -c -q -f /etc/haproxy/haproxy.cfg \
-        || { echo "ERROR: haproxy config check failed - fix before reload" >&2; exit 1; }
+    if ! haproxy -c -f /etc/haproxy/haproxy.cfg; then
+        echo "ERROR: haproxy 配置校验失败（详情见上方 error 行）；运行中的实例未被改动" >&2
+        exit 1
+    fi
     echo "haproxy config check OK"
 fi
 
-echo "haproxy.cfg updated (entry :${ENTRY_PORT}, $(grep -cE '^[[:space:]]+server ' /etc/haproxy/haproxy.cfg) backends)"
+echo "haproxy.cfg updated (entry :${ENTRY_PORT}, ${BACKENDS} backends)"
