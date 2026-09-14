@@ -47,6 +47,30 @@ SSH_OPTS="-o ConnectTimeout=10 ${SSH_OPTS:-}"   # shellcheck disable=SC2086
 
 fail() { echo "ERROR: $*" >&2; exit 1; }
 
+# ---- 可选：排除某些 IP，不进后端池 ----
+# 场景：机器上确实扫到了、但不想作为出口的 IP（管理口、回程未通的辅助 IP、临时网卡等）。
+# 两种写法任选其一（可同时用）：
+#   环境变量  EXCLUDE_IPS="1.2.3.4,5.6.7.8" ./deploy.sh
+#   文件      deploy/exclude-ips.txt         # 一行一个，# 开头为注释
+EXCLUDE_FILE="${EXCLUDE_FILE:-$DEPLOY_DIR/exclude-ips.txt}"
+if [ -f "$EXCLUDE_FILE" ]; then
+    while IFS= read -r _xl || [ -n "$_xl" ]; do
+        _xl="${_xl%%#*}"; _xl="${_xl%$'\r'}"
+        _xl="$(printf '%s' "$_xl" | tr -d '[:space:]')"
+        [ -n "$_xl" ] && EXCLUDE_IPS="${EXCLUDE_IPS:-},${_xl}"
+    done < "$EXCLUDE_FILE"
+fi
+is_excluded() {
+    local ip="$1" e
+    local -a arr=()
+    IFS=',' read -r -a arr <<< "${EXCLUDE_IPS:-}" || true
+    for e in "${arr[@]}"; do
+        e="${e// /}"
+        [ -n "$e" ] && [ "$e" = "$ip" ] && return 0
+    done
+    return 1
+}
+
 [ -d "$AGENT_DIR" ] || fail "agent/ not found under $REPO_ROOT"
 [ -f "$HOSTS_FILE" ] || fail "hosts file not found: $HOSTS_FILE"
 command -v rsync >/dev/null 2>&1 || fail "rsync is required locally"
@@ -128,18 +152,26 @@ wait
 # ---- 汇总结果，用真实 IP 生成后端配置 ----
 OUT="$SCHED_DIR/haproxy-servers.cfg"
 : > "$OUT"
-OK=0; FAILED=0
+OK=0; FAILED=0; EXC=0
 for t in "${TARGETS[@]}"; do
     tag="$(tag_of "$t")"
     if [ "$(cat "$RESULTS_DIR/$tag.code" 2>/dev/null)" = "0" ] && [ -f "$RESULTS_DIR/$tag.ips" ]; then
         OK=$((OK + 1))
-        echo "PASS  $tag"
-        n=0
+        n=0; kept=""; skipped=""
         while IFS= read -r ip; do
             [ -n "$ip" ] || continue
+            if is_excluded "$ip"; then
+                EXC=$((EXC + 1))
+                skipped="${skipped:+$skipped,}$ip"
+                continue
+            fi
             n=$((n + 1))
+            kept="${kept:+$kept,}$ip"
             echo "    server ${tag}i${n} ${ip}:1080 check inter 3s fall 3 rise 2" >> "$OUT"
         done < "$RESULTS_DIR/$tag.ips"
+        # 打印「机器 -> 出口 IP」映射，便于核对某个后端 IP 到底来自哪台机器
+        printf 'PASS  %-22s -> %s%s\n' "$tag" "${kept:-（无可用出口）}" \
+            "${skipped:+   已排除: $skipped}"
     else
         FAILED=$((FAILED + 1))
         echo "FAIL  $tag"
@@ -150,6 +182,7 @@ done
 TOTAL=$(grep -c . "$OUT" 2>/dev/null || echo 0)
 echo
 echo "Summary: $OK machine(s) OK, $FAILED failed, $TOTAL backends -> $OUT"
+[ "$EXC" -gt 0 ] && echo "         ($EXC 个 IP 被 EXCLUDE_IPS / exclude-ips.txt 排除，未写入后端)"
 [ "$FAILED" -eq 0 ] || { echo "Fix the failures above, then re-run."; exit 1; }
 [ "$TOTAL" -gt 0 ] || fail "no backends generated"
 

@@ -8,5 +8,8 @@ agent/socks-credentials.env
 # 代理机唯一清单（含明文密码），禁止提交
 deploy/hosts.txt
 
+# 出口 IP 排除名单（含真实 IP），禁止提交
+deploy/exclude-ips.txt
+
 # 本地工作区数据（会话日志等），不上远端
 .workbuddy/

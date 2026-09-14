@@ -74,8 +74,11 @@ proxy-pool/
 │   ├── deploy.sh              # 一键多机部署（并行 rsync + 拉真实 IP）
 │   ├── provision.sh           # 新机首次纳管（密码登录 → 装公钥/Docker/防火墙）
 │   ├── bootstrap.sh           # 在新机上执行：IP 自检 + Docker + 防火墙
+│   ├── verify-egress.sh       # 逐个直连后端，验证登记的 IP 是否真能出网
 │   ├── hosts.txt.example      # 代理机唯一清单模板
-│   └── hosts.txt              # 代理机唯一清单（含明文密码，已 gitignore）
+│   ├── exclude-ips.txt.example # 出口 IP 排除名单模板
+│   ├── hosts.txt              # 代理机唯一清单（含明文密码，已 gitignore）
+│   └── exclude-ips.txt        # 出口 IP 排除名单（已 gitignore）
 ├── .github/workflows/
 │   └── release.yml            # push main 自动发版 + 推镜像到 ghcr.io
 └── docs/
@@ -299,6 +302,8 @@ for i in $(seq 1 8); do curl -s --socks5 proxy-pool.example.com:1080 http://ifco
 | 重装 HAProxy 配置 | **调度机与代理机同机时必须带入口端口**：`sudo ENTRY_PORT=2080 ./scheduler/assemble-config.sh`。漏掉会写成 `bind *:1080`，与 3proxy 抢端口导致入口无监听（2080 上 `ss` 查不到、curl 报 Connection refused） |
 | 单 IP 故障 | 无需干预，HAProxy 自动剔除并自动恢复 |
 | 查看后端状态 | `ssh -L 8404:127.0.0.1:8404` 后访问状态页 |
+| 核对每个出口是否真能出网 | `./deploy/verify-egress.sh`（逐个直连后端，比对「登记的 IP」与「实测出网 IP」）；加 `ENTRY_HOST=<入口IP>` 顺带抽查入口轮询 |
+| 排除某个不想用作出口的 IP | 写进 `deploy/exclude-ips.txt`（一行一个），或 `EXCLUDE_IPS="1.2.3.4,5.6.7.8" ./deploy/deploy.sh` |
 
 故障影响：
 
@@ -308,6 +313,52 @@ for i in $(seq 1 8); do curl -s --socks5 proxy-pool.example.com:1080 http://ifco
 | 单机宕机 | 该机全部 IP 不可用 | HAProxy 自动剔除 |
 | 单 IP 故障 | 该 IP 不可用 | HAProxy 自动剔除 |
 | `up` 报 `container name "/proxy-XX" already in use` | 旧容器残留：compose 项目名=目录名，曾在别的目录（如 `/opt/proxy-pool/agent`）部署过的同名容器，当前项目的 `down` 看不见也删不掉 | `deploy.sh` 已内置自动清理（`down --remove-orphans` + 按名强删 `proxy-*`）；手工部署时先执行 `docker ps -aq --filter 'name=proxy-' \| xargs -r docker rm -f` 再 `up` |
+
+---
+
+## 后端清单与实际不符怎么办
+
+`scheduler/haproxy-servers.cfg` **每次部署都整文件重写**（`deploy.sh` 先 `: > "$OUT"` 清空，再从各机器 `.env` 拉 `IP_N` 写入；`.env` 又由 `generate-env.sh` 每次截断重建）。所以**文件里不存在"陈旧/残留"行**——多出来的 IP 一定对应 `hosts.txt` 里真实存在的机器。
+
+**第一步：把后端名还原成来源机器。** 后端名 = 主机名把 `.` 换成 `-` + 序号：
+
+```
+server 64-81-112-31i2 64.81.112.228:1080 ...
+       └── 来自主机 64.81.112.31，第 2 个 IP
+```
+
+> 注意：主机名是清单里写的那个（`root@127.0.0.1` 会生成 `127-0-0-1`），后端 IP 才是真实出口，两者可以完全不同。
+
+**第二步：找出差异。**
+
+```bash
+cd /opt/proxy-pool
+# 期望的出口 IP（逐行填你实际要用的）
+printf '%s\n' 103.207.68.201 154.36.158.189 154.36.178.53 \
+               154.40.45.130 154.40.45.34 64.81.112.148 64.83.38.16 | sort > /tmp/want.txt
+awk '/^[[:space:]]*server/ {split($3,a,":"); print a[1]}' scheduler/haproxy-servers.cfg | sort > /tmp/got.txt
+
+echo "--- 多出来的（应删机器或加排除）---"; comm -13 /tmp/want.txt /tmp/got.txt
+echo "--- 缺失的（机器没起来/没扫到 IP）---"; comm -23 /tmp/want.txt /tmp/got.txt
+```
+
+**第三步：按结果处理。**
+
+| 差异类型 | 原因 | 处理 |
+|---|---|---|
+| 多出来整台机器 | `hosts.txt` 里有你不想要的机器 | 删掉该行 → 重跑 `deploy.sh` |
+| 多出来某台的第 2 个 IP | 该机网卡上绑了辅助 IP（云商常见） | 想保留就用；不想用写进 `deploy/exclude-ips.txt` |
+| 缺失 | 该机容器没起 / 没扫到 IP / SSH 失败 | 看 deploy 输出里那台的日志；在该机跑 `ip -4 -o addr show` 核对 |
+
+**第四步：实测到底能不能出网。** 「网卡上有 IP」不等于「能以该 IP 出网」（辅助 IP 回程路由未配通是云商高频坑）。`verify-egress.sh` 逐个直连后端比对：
+
+```bash
+./deploy/verify-egress.sh
+# 顺带抽查入口轮询是否覆盖全部出口：
+ENTRY_HOST=154.40.45.34 ENTRY_PORT=2080 ./deploy/verify-egress.sh
+```
+
+输出 `MISMATCH` / `FAIL` 的行，要么修该机的辅助 IP 路由，要么把它写进排除名单。
 
 ---
 ## 加机器
